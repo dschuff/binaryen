@@ -155,10 +155,10 @@ struct Literal {
   float   getf32() { assert(type == WasmType::f32); return f32; }
   double  getf64() { assert(type == WasmType::f64); return f64; }
 
-  int32_t reinterpreti32() { assert(type == WasmType::f32); return i32; }
-  int64_t reinterpreti64() { assert(type == WasmType::f64); return i64; }
-  float   reinterpretf32() { assert(type == WasmType::i32); return f32; }
-  double  reinterpretf64() { assert(type == WasmType::i64); return f64; }
+  int32_t reinterpreti32() { assert(type == WasmType::f32); return bit_cast<int32_t>(f32); }
+  int64_t reinterpreti64() { assert(type == WasmType::f64); return bit_cast<int64_t>(f64); }
+  float   reinterpretf32() { assert(type == WasmType::i32); return bit_cast<float>(i32); }
+  double  reinterpretf64() { assert(type == WasmType::i64); return bit_cast<double>(i64); }
 
   int64_t getInteger() {
     switch (type) {
@@ -176,49 +176,60 @@ struct Literal {
     }
   }
 
+  int32_t floatPayload() {
+    assert(type == WasmType::f32);
+    assert(std::isnan(f32));
+    return ~0xffc00000u & bit_cast<uint32_t>(f32);
+  }
+
+  int64_t doublePayload() {
+    assert(type == WasmType::f64);
+    assert(std::isnan(f64));
+    return ~0xfff8000000000000ull & bit_cast<uint64_t>(f64);
+  }
+
   bool operator==(Literal& other) {
     if (type != other.type) return false;
     switch (type) {
       case WasmType::none: return true;
       case WasmType::i32: return i32 == other.i32;
       case WasmType::i64: return i64 == other.i64;
-      // reinterpret floating-point, to avoid nan != nan
-      case WasmType::f32: return reinterpreti32() == other.reinterpreti32();
-      case WasmType::f64: return reinterpreti64() == other.reinterpreti64();
+      case WasmType::f32: return f32 == other.f32;
+      case WasmType::f64: return f64 == other.f64;
       default: abort();
     }
   }
 
-  static void printFloat(std::ostream &o, float f) {
-    if (isnan(f)) {
-      const char *sign = std::signbit(f) ? "-" : "";
+  void printFloat(std::ostream &o) {
+    if (isnan(f32)) {
+      const char *sign = std::signbit(f32) ? "-" : "";
       o << sign << "nan";
-      if (uint32_t payload = ~0xffc00000u & bit_cast<uint32_t>(f)) {
+      if (uint32_t payload = floatPayload()) {
         o << ":0x" << std::hex << payload << std::dec;
       }
       return;
     }
-    printDouble(o, f);
+    Literal(double(f32)).printDouble(o);
   }
 
-  static void printDouble(std::ostream &o, double d) {
-    if (d == 0 && std::signbit(d)) {
+  void printDouble(std::ostream &o) {
+    if (f64 == 0 && std::signbit(f64)) {
       o << "-0";
       return;
     }
-    if (isnan(d)) {
-      const char *sign = std::signbit(d) ? "-" : "";
+    if (isnan(f64)) {
+      const char *sign = std::signbit(f64) ? "-" : "";
       o << sign << "nan";
-      if (uint64_t payload = ~0xfff8000000000000ull & bit_cast<uint64_t>(d)) {
+      if (uint64_t payload = doublePayload()) {
         o << ":0x" << std::hex << payload << std::dec;
       }
       return;
     }
-    if (!std::isfinite(d)) {
-      o << (std::signbit(d) ? "-infinity" : "infinity");
+    if (!std::isfinite(f64)) {
+      o << (std::signbit(f64) ? "-infinity" : "infinity");
       return;
     }
-    const char *text = cashew::JSPrinter::numToString(d);
+    const char *text = cashew::JSPrinter::numToString(f64);
     // spec interpreter hates floats starting with '.'
     if (text[0] == '.') {
       o << '0';
@@ -236,8 +247,8 @@ struct Literal {
       case none: o << "?"; break;
       case WasmType::i32: o << literal.i32; break;
       case WasmType::i64: o << literal.i64; break;
-      case WasmType::f32: literal.printFloat(o, literal.f32); break;
-      case WasmType::f64: literal.printDouble(o, literal.f64); break;
+      case WasmType::f32: literal.printFloat(o); break;
+      case WasmType::f64: literal.printDouble(o); break;
     }
     restoreNormalColor(o);
     return o << ')';
