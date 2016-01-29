@@ -175,6 +175,21 @@ struct Invocation {
   }
 };
 
+static void verify_result(Literal a, Literal b) {
+  if (a == b) return;
+  // accept equal nans
+  assert(a.type == b.type);
+  if (a.type == f32) {
+    assert(std::signbit(a.f32) == std::signbit(b.f32));
+    assert(a.floatPayload() == b.floatPayload());
+  } else if (a.type == f64) {
+    assert(std::signbit(a.f64) == std::signbit(b.f64));
+    assert(a.doublePayload() == b.doublePayload());
+  } else {
+    abort();
+  }
+}
+
 static void run_asserts(size_t* i, bool* checked, AllocatingModule* wasm,
                         Element* root,
                         std::unique_ptr<SExpressionWasmBuilder>* builder,
@@ -243,11 +258,11 @@ static void run_asserts(size_t* i, bool* checked, AllocatingModule* wasm,
                                  ->dyn_cast<Const>()
                                  ->value;
           std::cerr << "seen " << result << ", expected " << expected << '\n';
-          assert(expected == result);
+          verify_result(expected, result);
         } else {
           Literal expected;
           std::cerr << "seen " << result << ", expected " << expected << '\n';
-          assert(expected == result);
+          verify_result(expected, result);
         }
       }
       if (id == ASSERT_TRAP) assert(trapped);
