@@ -532,6 +532,7 @@ class WasmBinaryWriter : public Visitor<WasmBinaryWriter, void> {
   Function* currFunction = nullptr;
   bool debug;
   bool debugInfo = true;
+  std::ofstream* binaryMap;
   std::string symbolMap;
 
   MixedArena allocator;
@@ -542,7 +543,8 @@ public:
     prepare();
   }
 
-  void setDebugInfo(bool set) { debugInfo = set; }
+  void setNamesSection(bool set) { debugInfo = set; }
+  void setBinaryMap(std::ofstream* set) { binaryMap = set; }
   void setSymbolMap(std::string set) { symbolMap = set; }
 
   void write();
@@ -604,13 +606,13 @@ public:
   std::vector<Name> breakStack;
 
   void visit(Expression* curr) {
-    if (debugInfo && currFunction) {
-      // show an annotation, if there is one
+    if (binaryMap && currFunction) {
+      // Dump the binaryMap debug info
       auto& debugLocations = currFunction->debugLocations;
       auto iter = debugLocations.find(curr);
       if (iter != debugLocations.end()) {
         auto fileName = wasm->debugInfoFileNames[iter->second.fileIndex];
-        std::cout << std::hex <<o.size() << ":" << fileName << ":" << std::dec <<iter->second.lineNumber << '\n';
+        *binaryMap << o.size() << ":" << fileName << ":" <<iter->second.lineNumber << '\n';
       }
     }
     Visitor<WasmBinaryWriter>::visit(curr);
