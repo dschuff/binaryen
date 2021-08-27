@@ -2,7 +2,7 @@ FROM ubuntu:bionic
 
 RUN \
   apt-get update && \
-    apt-get install -y build-essential cmake python3 curl nodejs
+    apt-get install -y build-essential cmake python3 curl nodejs ninja-build
 
 # Add source for nodejs,
 # see https://nodejs.org/en/download/package-manager/#debian-and-ubuntu-based-linux-distributions
@@ -12,7 +12,7 @@ RUN \
 COPY . /test
 WORKDIR /test
 
-RUN ./check.py --only-prepare
+RUN ./scripts/gen-s-parser.py | diff src/gen-s-parser.inc -
 
 RUN rm CMakeCache.txt
 RUN cmake .
