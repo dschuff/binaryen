@@ -1,10 +1,9 @@
 steps:
-  - name: 'Install'
+  - name: 'ubuntu:bionic'
     args: ['apt-get', 'update', '&&', 'apt-get', 'install', 'git', 'cmake', 'ninja-build']
   - name: 'Generate Parser'
     args: ['./scripts/gen-s-parser.py']
-  - name: 'CMake'
+  - name: 'ubuntu:bionic'
     args: ['cmake', '-G', 'Ninja', '.']
-  - name: 'Build'
+  - name: 'ubntu:bionic'
     args: ['ninja']
-    
