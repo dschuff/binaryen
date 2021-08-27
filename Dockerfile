@@ -2,7 +2,7 @@ FROM ubuntu:bionic
 
 RUN \
   apt-get update && \
-    apt-get install -y build-essential cmake python3 curl nodejs ninja-build
+    apt-get install -y build-essential cmake python3 curl nodejs ninja-build git
 
 # Add source for nodejs,
 # see https://nodejs.org/en/download/package-manager/#debian-and-ubuntu-based-linux-distributions
