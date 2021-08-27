@@ -1,6 +1,6 @@
 steps:
   - name: 'ubuntu:bionic'
-    args: ['install.sh']
+    args: ['./install.sh']
   - name: 'ubuntu:bionic'
     args: ['./scripts/gen-s-parser.py']
   - name: 'ubuntu:bionic'
