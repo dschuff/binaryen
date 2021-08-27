@@ -1,6 +1,6 @@
 steps:
   - name: 'ubuntu:bionic'
-    args: ['apt-get', 'update', '&&', 'apt-get', 'install', 'git', 'cmake', 'ninja-build']
+    args: ['apt-get', 'apt-get', 'install', 'git', 'cmake', 'ninja-build']
   - name: 'ubuntu:bionic'
     args: ['./scripts/gen-s-parser.py']
   - name: 'ubuntu:bionic'
