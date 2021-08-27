@@ -1,0 +1,10 @@
+steps:
+  - name: 'Install'
+    args: ['apt-get', 'update', '&&', 'apt-get', 'install', 'git', 'cmake', 'ninja-build']
+  - name: 'Generate Parser'
+    args: ['./scripts/gen-s-parser.py']
+  - name: 'CMake'
+    args: ['cmake', '-G', 'Ninja', '.']
+  - name: 'Build'
+    args: ['ninja']
+    

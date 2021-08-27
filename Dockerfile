@@ -15,5 +15,5 @@ WORKDIR /test
 RUN ./scripts/gen-s-parser.py | diff src/gen-s-parser.inc -
 
 RUN rm -f CMakeCache.txt
-RUN cmake .
-RUN make -j2
+RUN cmake -G Ninja .
+RUN ninja
