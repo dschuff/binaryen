@@ -10,6 +10,8 @@ RUN \
 # RUN curl -sL https://deb.nodesource.com/setup_8.x | sudo -E bash -
 # RUN apt-get install nodejs
 
+RUN git submodule update --init
+
 COPY . /test
 WORKDIR /test
 
