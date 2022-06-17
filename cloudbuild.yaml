@@ -1,9 +1,9 @@
 steps:
-  - name: 'ubuntu:bionic'
+  - name: 'ubuntu:jammy'
     args: ['./install.sh']
-  - name: 'ubuntu:bionic'
+  - name: 'ubuntu:jammy'
     args: ['./scripts/gen-s-parser.py']
-  - name: 'ubuntu:bionic'
+  - name: 'ubuntu:jammy'
     args: ['cmake', '-G', 'Ninja', '.']
-  - name: 'ubntu:bionic'
+  - name: 'ubntu:jammy'
     args: ['ninja']
