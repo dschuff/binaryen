@@ -2,8 +2,11 @@ steps:
   - name: 'ubuntu:jammy'
     args: ['./install.sh']
   - name: 'ubuntu:jammy'
-    args: ['./scripts/gen-s-parser.py']
+    args: ['python3 ./scripts/gen-s-parser.py']
   - name: 'ubuntu:jammy'
     args: ['cmake', '-G', 'Ninja', '.']
   - name: 'ubntu:jammy'
     args: ['ninja']
+
+options:
+  machineType: 'N1_HIGHCPU_8'
