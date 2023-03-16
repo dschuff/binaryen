@@ -1,8 +1,8 @@
 steps:
   - name: 'ubuntu:jammy'
     args: ['./install.sh']
-  - name: 'ubuntu:jammy'
-    args: ['python3', './scripts/gen-s-parser.py']
+  - name: 'python3'
+    args: ['./scripts/gen-s-parser.py']
   - name: 'ubuntu:jammy'
     args: ['cmake', '-G', 'Ninja', '.']
   - name: 'ubntu:jammy'
