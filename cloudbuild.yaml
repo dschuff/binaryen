@@ -1,8 +1,8 @@
 steps:
   - name: 'docker'
-    args: ['build', '.']
-  - name: 'ubuntu:jammy'
-    args: ['./install.sh']
+    args: ['build', '-t', 'gcr.io/$PROJECT_ID/myimage', '.']
+  - name: 'docker'
+    args: ['run', 'gcr.io/$PROJECT_ID/myimage']
   - name: 'ubuntu:jammy'
     args: ['./build.sh']
 options:
