@@ -19,6 +19,8 @@ RUN git submodule update --init
 
 RUN ./scripts/gen-s-parser.py | diff src/gen-s-parser.inc -
 
-RUN rm -f CMakeCache.txt
-RUN cmake -G Ninja .
-RUN ninja wasm-emscripten-finalize
+#RUN rm -f CMakeCache.txt
+RUN mkdir out/
+RUN cmake -G Ninja -S . -B out
+RUN cmake --build out --config Release
+RUN cmake --install out

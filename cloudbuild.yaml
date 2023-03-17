@@ -2,6 +2,10 @@ steps:
   - name: 'docker'
     args: ['build', '-t', 'gcr.io/$PROJECT_ID/myimage', '.']
   - name: 'docker'
-    args: ['run', 'gcr.io/$PROJECT_ID/myimage', 'ls']
+    args: ['run', 'gcr.io/$PROJECT_ID/myimage', 'ls', '.', 'out']
+  - name: 'docker'
+    args: ['run', 'gcr.io/$PROJECT_ID/myimage', 'python3', 'out/bin/binaryen-lit', 'test/lit/parse-error.wast']
+  - name: 'docker'
+    args: ['run', 'gcr.io/$PROJECT_ID/myimage', 'python', 'check.py', '--binaryen-bin=out/bin']    
 options:
   machineType: 'N1_HIGHCPU_8'
