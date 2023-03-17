@@ -21,4 +21,4 @@ RUN ./scripts/gen-s-parser.py | diff src/gen-s-parser.inc -
 
 RUN rm -f CMakeCache.txt
 RUN cmake -G Ninja .
-RUN ninja
+RUN ninja wasm-emscripten-finalize
