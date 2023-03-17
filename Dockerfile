@@ -16,6 +16,7 @@ COPY . /test
 WORKDIR /test
 
 RUN git submodule update --init
+RUN pip3 install -r requirements-dev.txt
 
 RUN ./scripts/gen-s-parser.py | diff src/gen-s-parser.inc -
 
