@@ -8,4 +8,4 @@ steps:
   - name: 'docker'
     args: ['run', 'gcr.io/$PROJECT_ID/myimage', 'python3', 'check.py', '--binaryen-bin=out/bin']
 options:
-  machineType: 'N1_HIGHCPU_8'
+  machineType: 'E2_HIGHCPU_8'
