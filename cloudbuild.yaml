@@ -2,6 +2,6 @@ steps:
   - name: 'docker'
     args: ['build', '-t', 'gcr.io/$PROJECT_ID/myimage', '.']
   - name: 'docker'
-    args: ['exec', 'gcr.io/$PROJECT_ID/myimage', 'ls']
+    args: ['run', 'gcr.io/$PROJECT_ID/myimage', 'ls']
 options:
   machineType: 'N1_HIGHCPU_8'
