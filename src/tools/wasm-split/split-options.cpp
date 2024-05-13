@@ -73,6 +73,9 @@ std::ostream& operator<<(std::ostream& o, WasmSplitOptions::Mode& mode) {
     case WasmSplitOptions::Mode::PrintProfile:
       o << "print-profile";
       break;
+    case wasm::WasmSplitOptions::Mode::CallgraphAnalyze:
+      o << "callgraph-analyze";
+      break;
   }
   return o;
 }
@@ -128,6 +131,14 @@ WasmSplitOptions::WasmSplitOptions()
            mode = Mode::PrintProfile;
            profileFile = argument;
          })
+    .add("--callgraph-analyze",
+         "",
+         "Analyze callgraph",
+         WasmSplitOption,
+         Options::Arguments::Zero,
+         [&](Options* o, const std::string& argument) {
+           mode = Mode::CallgraphAnalyze;
+        })
     .add(
       "--profile",
       "",
@@ -450,6 +461,11 @@ bool WasmSplitOptions::validate() {
     case Mode::PrintProfile:
       if (inputFiles.size() != 1) {
         fail("Must have exactly one profile path.");
+      }
+      break;
+    case Mode::CallgraphAnalyze:
+      if (inputFiles.size() != 1) {
+        fail("Must have exactly one input file.");
       }
       break;
   }

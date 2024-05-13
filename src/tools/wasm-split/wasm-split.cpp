@@ -19,6 +19,7 @@
 
 #include <fstream>
 
+#include "analysis/callgraph.h"
 #include "ir/module-splitting.h"
 #include "ir/names.h"
 #include "support/file.h"
@@ -562,6 +563,12 @@ void printReadableProfile(const WasmSplitOptions& options) {
   std::cout << std::endl;
 }
 
+void analyzeCallgraph(const WasmSplitOptions& options) {
+  Module wasm;
+  parseInput(wasm, options);
+  wasm::analysis::RunCallgraphAnalysis(&wasm);
+}
+
 } // anonymous namespace
 
 int main(int argc, const char* argv[]) {
@@ -587,6 +594,9 @@ int main(int argc, const char* argv[]) {
       break;
     case WasmSplitOptions::Mode::PrintProfile:
       printReadableProfile(options);
+      break;
+    case wasm::WasmSplitOptions::Mode::CallgraphAnalyze:
+      analyzeCallgraph(options);
       break;
   }
 }

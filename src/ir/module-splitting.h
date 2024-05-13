@@ -40,6 +40,8 @@
 #ifndef wasm_ir_module_splitting_h
 #define wasm_ir_module_splitting_h
 
+#include "ir/module-utils.h"
+#include "ir/element-utils.h"
 #include "wasm.h"
 
 namespace wasm::ModuleSplitting {
@@ -82,6 +84,22 @@ struct Results {
 
 // Returns the new secondary module and modifies the `primary` module in place.
 Results splitFunctions(Module& primary, const Config& config);
+
+template<class F> void forEachElement(Module& module, F f) {
+  ModuleUtils::iterActiveElementSegments(module, [&](ElementSegment* segment) {
+    Name base = "";
+    Index offset = 0;
+    if (auto* c = segment->offset->dynCast<Const>()) {
+      offset = c->value.geti32();
+    } else if (auto* g = segment->offset->dynCast<GlobalGet>()) {
+      base = g->name;
+    }
+    ElementUtils::iterElementSegmentFunctionNames(
+      segment, [&](Name& entry, Index i) {
+        f(segment->table, base, offset + i, entry);
+      });
+  });
+}
 
 } // namespace wasm::ModuleSplitting
 

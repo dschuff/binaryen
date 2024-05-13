@@ -470,6 +470,8 @@ public:
   bool operator==(const BasicType& other) const { return id == other; }
   bool operator!=(const Type& other) const { return id != other.id; }
   bool operator!=(const BasicType& other) const { return id != other; }
+  bool operator<(const Type& other) const {return id < other.id; }
+  bool operator<(const BasicType& other) const {return id < other; }
 
   // Returns the type size in bytes. Only single types are supported.
   unsigned getByteSize() const;
@@ -626,6 +628,9 @@ struct Signature {
     return params == other.params && results == other.results;
   }
   bool operator!=(const Signature& other) const { return !(*this == other); }
+  bool operator<(const Signature& other) const {
+    return params < other.params && results < other.results;
+  }
   std::string toString() const;
 };
 
