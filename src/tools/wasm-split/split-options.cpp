@@ -139,6 +139,15 @@ WasmSplitOptions::WasmSplitOptions()
          [&](Options* o, const std::string& argument) {
            mode = Mode::CallgraphAnalyze;
         })
+    .add("--callgraph-entrypoints",
+         "",
+        "callgraph analysis entrypoints",
+        WasmSplitOption,
+        {Mode::CallgraphAnalyze},
+        Options::Arguments::N,
+        [&](Options* o, const std::string& argument) {
+          entryPoints.push_back(parseNameList(argument));
+        })
     .add(
       "--profile",
       "",

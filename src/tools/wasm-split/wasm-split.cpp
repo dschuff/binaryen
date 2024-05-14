@@ -33,6 +33,7 @@
 
 #include "instrumenter.h"
 #include "split-options.h"
+#include "wasm.h"
 
 using namespace wasm;
 
@@ -566,7 +567,11 @@ void printReadableProfile(const WasmSplitOptions& options) {
 void analyzeCallgraph(const WasmSplitOptions& options) {
   Module wasm;
   parseInput(wasm, options);
-  wasm::analysis::RunCallgraphAnalysis(&wasm);
+  std::vector<wasm::analysis::EntryPointGroup> entryPoints;
+  for (const auto& arg : options.entryPoints) {
+    entryPoints.emplace_back(arg);
+  }
+  wasm::analysis::RunCallgraphAnalysis(&wasm, entryPoints);
 }
 
 } // anonymous namespace

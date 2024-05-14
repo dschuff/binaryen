@@ -17,25 +17,25 @@
 #include "callgraph.h"
 #include "ir/module-splitting.h"
 #include "wasm-traversal.h"
+#include "wasm-type.h"
 #include "wasm.h"
 #include <deque>
 #include <iostream>
+#include <memory>
+#include <optional>
 #include <unordered_set>
-#include <variant>
 
 namespace wasm::analysis {
-
-using ElemsBySig = std::multimap<Signature, Name>;
 
 
 class CallgraphPostwalker : public PostWalker<CallgraphPostwalker> {
  public:
-  CallgraphPostwalker(Callgraph* full_graph, ElemsBySig* elems_by_sig) :
-    full_graph(full_graph), elems_by_sig(elems_by_sig) {}
+  CallgraphPostwalker(Callgraph* full_graph) :
+    full_graph(full_graph) {}
 
   // Visit a function declaration
   void visitFunction(Function* func) {
-    std::cerr << "Visiting function " << func->name << std::endl;
+    // std::cerr << "Visiting function " << func->name << std::endl;
     CGNode& node = full_graph->nodes[func->name];
     for (const auto& callee : direct_callees) {
       node.direct_callees.push_back(&full_graph->nodes[callee]);
@@ -49,37 +49,48 @@ class CallgraphPostwalker : public PostWalker<CallgraphPostwalker> {
 
   void visitCall(Call* call)  {
     auto result [[ maybe_unused ]] = direct_callees.insert(call->target);
-    if (result.second) std::cerr << " Visiting call from " << getFunction()->name << " to " << call->target << std::endl;
+    // if (result.second) std::cerr << " Visiting call from " << getFunction()->name << " to " << call->target << std::endl;
+  }
+
+  static bool isTargetReachable(Signature call_sig, Signature target_sig) {
+    if (!Type::isSubType(target_sig.results, call_sig.results)) {
+      return false;
+    }
+    if (call_sig.params.size() != target_sig.params.size()) {
+      return false;
+    }
+    for (size_t i = 0; i < call_sig.params.size(); ++i) {
+      if (!Type::isSubType(call_sig.params[i], target_sig.params[i])) {
+        return false;
+      }
+    }
+    return true;
   }
 
   void visitCallIndirect(CallIndirect* call) {
     auto signature = call->heapType.getSignature();
-    auto reachable_funcs = elems_by_sig->equal_range(signature);
-    for (auto it = reachable_funcs.first; it != reachable_funcs.second; ++it) {
-      auto& func = it->second;
+    // Find all functions reachable via this type signature
+    Module& currModule = *getModule();
+    ModuleSplitting::forEachElement(currModule, [&](Name table, Name base, Index offset, Name func) {
+      const Signature &target_sig = currModule.getFunction(func)->getSig();
+      // std::cerr << "Found element " << func << " sig " << target_sig << std::endl;
+      if (table != call->table) {
+        return;
+      }
+      if (!isTargetReachable(signature, target_sig)) {
+        return;
+      }
       auto result [[ maybe_unused ]] = indirect_reachables.insert(func);
       if (result.second) std::cerr << " Visiting indirect call from " << getFunction()->name << " to " << func << 
-        " with signature " << it->first << std::endl;
-    }
+        " with signature " << target_sig << std::endl;  
+    });
   }
 
  private:
   std::unordered_set<Name> direct_callees;
   std::unordered_set<Name> indirect_reachables;
   Callgraph* full_graph;
-  ElemsBySig* elems_by_sig;
 };
-
-
-ElemsBySig GetElemsBySig(Module* module) {
-  // TODO: Handle multiple tables
-  ElemsBySig elems_by_sig;
-  ModuleSplitting::forEachElement(*module, [&](Name table, Name base, Index offset, Name func) {
-    std::cerr << "Found element " << func << " sig " << module->getFunction(func)->getSig() << std::endl;
-    elems_by_sig.emplace(module->getFunction(func)->getSig(), func);
-  });
-  return elems_by_sig;
-}
 
 void DumpCallgraph(const Callgraph* graph) {
   for (const auto& node : graph->nodes) {
@@ -95,17 +106,22 @@ void DumpCallgraph(const Callgraph* graph) {
 
 using ReachableSet = std::vector<const CGNode*>;
 
-ReachableSet GetReachableSubgraph(const Callgraph* graph, Name entry) {
-//void DumpReachableSubgraph(const Callgraph* graph, Name entry) {
-  std::cout << "Reachable subgraph from " << entry << '\n';
-  if (graph->nodes.count(entry) == 0) {
-    std::cerr << "Entry point " << entry << " not found in graph\n";
-    return {};
+ReachableSet GetReachableSubgraph(const Callgraph* graph, EntryPointGroup entrypoints) {
+  std::cout << "Reachable subgraph from {";
+  for (const auto& entry : entrypoints) {
+    std::cout << entry << ", ";
   }
+  std::cout << "}\n";
+
   std::deque<const CGNode*> worklist;
   std::unordered_set<const CGNode*> visited;
   ReachableSet result;
-  worklist.push_back(&graph->nodes.at(entry));
+  for (const auto& entry : entrypoints) {
+    if (graph->nodes.count(entry) == 0) {
+      std::cerr << "Entry point " << entry << " not found in graph\n";
+    }
+    worklist.push_back(&graph->nodes.at(entry));
+  }
   while (!worklist.empty()) {
     const CGNode* node = worklist.front();
     worklist.pop_front();
@@ -127,18 +143,25 @@ ReachableSet GetReachableSubgraph(const Callgraph* graph, Name entry) {
 }
 
 // Analyze a module and build a callgraph
-void RunCallgraphAnalysis(Module* module) {
+void RunCallgraphAnalysis(Module* module, std::vector<EntryPointGroup> entrypoints) {
   Callgraph full_graph;
-  ElemsBySig elems_by_sig = GetElemsBySig(module);
-  CallgraphPostwalker postwalker(&full_graph, &elems_by_sig);
+  CallgraphPostwalker postwalker(&full_graph);
   for (auto& function : module->functions) {
     CGNode node {function->name, function.get(), {}, {}};
     full_graph.nodes.emplace(function->name, std::move(node));
   }
   postwalker.walkModule(module);
   DumpCallgraph(&full_graph);
-  for (auto& ex : module->exports) {
-    GetReachableSubgraph(&full_graph, ex->name);
+  if (entrypoints.empty()) {
+    for (auto& ex : module->exports) {
+      entrypoints.push_back({ex->name});
+    }
+  }
+  
+  for (auto& ep : entrypoints) {
+    auto reachable_set = GetReachableSubgraph(&full_graph, ep);
+    std::cout << "Entry point beginning with " << *ep.begin() << " has " << ":" << reachable_set.size() <<
+    " nodes, " << (float)reachable_set.size() / (float)full_graph.nodes.size() * 100.0f << "%\n";
   }
 }
 

@@ -61,6 +61,7 @@ struct WasmSplitOptions : ToolOptions {
   std::set<Name> splitFuncs;
   bool hasKeepFuncs = false;
   bool hasSplitFuncs = false;
+  std::vector<std::set<Name>> entryPoints;
 
   std::vector<std::string> inputFiles;
   std::string output;
