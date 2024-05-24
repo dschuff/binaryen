@@ -571,7 +571,7 @@ void analyzeCallgraph(const WasmSplitOptions& options) {
   for (const auto& arg : options.entryPoints) {
     entryPoints.emplace_back(arg);
   }
-  wasm::analysis::RunCallgraphAnalysis(&wasm, entryPoints);
+  wasm::analysis::RunCallgraphAnalysis(&wasm, entryPoints, options.verbose);
 }
 
 } // anonymous namespace

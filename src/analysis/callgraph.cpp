@@ -19,6 +19,7 @@
 #include "wasm-traversal.h"
 #include "wasm-type.h"
 #include "wasm.h"
+#include <cstddef>
 #include <deque>
 #include <iostream>
 #include <memory>
@@ -35,7 +36,7 @@ class CallgraphPostwalker : public PostWalker<CallgraphPostwalker> {
 
   // Visit a function declaration
   void visitFunction(Function* func) {
-    // std::cerr << "Visiting function " << func->name << std::endl;
+    std::cerr << "Visiting function " << func->name << std::endl;
     CGNode& node = full_graph->nodes[func->name];
     for (const auto& callee : direct_callees) {
       node.direct_callees.push_back(&full_graph->nodes[callee]);
@@ -81,8 +82,8 @@ class CallgraphPostwalker : public PostWalker<CallgraphPostwalker> {
         return;
       }
       auto result [[ maybe_unused ]] = indirect_reachables.insert(func);
-      if (result.second) std::cerr << " Visiting indirect call from " << getFunction()->name << " to " << func << 
-        " with signature " << target_sig << std::endl;  
+      //if (result.second) std::cerr << " Visiting indirect call from " << getFunction()->name << " to " << func << 
+      //  " with signature " << target_sig << std::endl;  
     });
   }
 
@@ -106,7 +107,7 @@ void DumpCallgraph(const Callgraph* graph) {
 
 using ReachableSet = std::vector<const CGNode*>;
 
-ReachableSet GetReachableSubgraph(const Callgraph* graph, EntryPointGroup entrypoints) {
+ReachableSet GetReachableSubgraph(const Callgraph* graph, EntryPointGroup entrypoints, bool verbose = false) {
   std::cout << "Reachable subgraph from {";
   for (const auto& entry : entrypoints) {
     std::cout << entry << ", ";
@@ -116,6 +117,11 @@ ReachableSet GetReachableSubgraph(const Callgraph* graph, EntryPointGroup entryp
   std::deque<const CGNode*> worklist;
   std::unordered_set<const CGNode*> visited;
   ReachableSet result;
+
+  size_t direct_edges = 0;
+  size_t indirect_edges = 0;
+  size_t total_nodes = 0;
+
   for (const auto& entry : entrypoints) {
     if (graph->nodes.count(entry) == 0) {
       std::cerr << "Entry point " << entry << " not found in graph\n";
@@ -125,7 +131,11 @@ ReachableSet GetReachableSubgraph(const Callgraph* graph, EntryPointGroup entryp
   while (!worklist.empty()) {
     const CGNode* node = worklist.front();
     worklist.pop_front();
-    visited.insert(node);
+    if(!visited.insert(node).second) continue;
+    direct_edges += node->direct_callees.size();
+    indirect_edges += node->indirect_reachables.size();
+    total_nodes++;
+
     for (const auto& direct_callee : node->direct_callees) {
       if (!visited.count(direct_callee)) {
         worklist.push_back(direct_callee);
@@ -136,14 +146,25 @@ ReachableSet GetReachableSubgraph(const Callgraph* graph, EntryPointGroup entryp
         worklist.push_back(indirect_reachable);
       }
     }
-    std::cout << "Node: " << node->name << '\n';
+    if (verbose) {
+      std::cout << "Node: " << node->name << '\n';
+    }
     result.push_back(node);
+    assert(result.size() == visited.size());
+    assert(result.size() == total_nodes);
   }
+
+  std::cout << "Total nodes: " << total_nodes << '\n';
+  size_t total_edges = direct_edges + indirect_edges;
+  std::cout << "Total edges: " << total_edges << '\n';
+  std::cout << "Direct edges: " << direct_edges << " " << (float)direct_edges / (float)total_edges * 100.0f << "%\n";
+  std::cout << "Indirect edges: " << indirect_edges << " " << (float)indirect_edges / (float)total_edges * 100.0f << "%\n";
+
   return result;
 }
 
 // Analyze a module and build a callgraph
-void RunCallgraphAnalysis(Module* module, std::vector<EntryPointGroup> entrypoints) {
+void RunCallgraphAnalysis(Module* module, std::vector<EntryPointGroup> entrypoints, bool verbose) {
   Callgraph full_graph;
   CallgraphPostwalker postwalker(&full_graph);
   for (auto& function : module->functions) {
@@ -151,17 +172,31 @@ void RunCallgraphAnalysis(Module* module, std::vector<EntryPointGroup> entrypoin
     full_graph.nodes.emplace(function->name, std::move(node));
   }
   postwalker.walkModule(module);
-  DumpCallgraph(&full_graph);
+  if (verbose) {
+    DumpCallgraph(&full_graph);
+  }
   if (entrypoints.empty()) {
     for (auto& ex : module->exports) {
-      entrypoints.push_back({ex->name});
+      std::cout << "Export " << ex->name << " with value " << ex->value <<'\n';
+      if (ex->kind != ExternalKind::Function) continue;
+      if (module->getFunction(ex->value)->imported()) continue;
+      entrypoints.push_back({ex->value});
     }
   }
-  
+
+  std::cout << "Table contents:\n";  
+  size_t elem_count = 0;
+  ModuleSplitting::forEachElement(*module, [&](Name table, Name base, Index offset, Name func) {
+    std::cout << "Elem " << func << std::endl;
+    elem_count++;
+  });
+  std::cout << "Total elements: " << elem_count << " " << (float)elem_count / (float)module->functions.size() * 100.0f << "%" << std::endl;
+
+
   for (auto& ep : entrypoints) {
-    auto reachable_set = GetReachableSubgraph(&full_graph, ep);
-    std::cout << "Entry point beginning with " << *ep.begin() << " has " << ":" << reachable_set.size() <<
-    " nodes, " << (float)reachable_set.size() / (float)full_graph.nodes.size() * 100.0f << "%\n";
+    auto reachable_set = GetReachableSubgraph(&full_graph, ep, verbose);
+    std::cout << "Entry point beginning with " << *ep.begin() << " has: " << reachable_set.size() <<
+    " nodes, " << (float)reachable_set.size() / (float)full_graph.nodes.size() * 100.0f << "%" << std::endl;
   }
 }
 
