@@ -74,7 +74,7 @@ option(JS_OF_OCAML "Build binaryen.js for js_of_ocaml" OFF)
 option(BUILD_FOR_BROWSER "Build binaryen toolchain utilities for the browser" OFF)
 
 # Turn this on to use the Wasm EH feature instead of emscripten EH in the wasm/BinaryenJS builds
-option(EMSCRIPTEN_ENABLE_WASM_EH "Enable Wasm EH feature in emscripten build" OFF)
+option(EMSCRIPTEN_ENABLE_WASM_EH "Enable Wasm EH feature in emscripten build" ON)
 
 option(EMSCRIPTEN_ENABLE_WASM64 "Enable memory64 in emscripten build" OFF)
 
@@ -305,12 +305,14 @@ if(EMSCRIPTEN)
   # Note that this is debug info for Binaryen itself, that is, when you are
   # debugging Binaryen source code. This flag has no impact on what Binaryen
   # does when run on wasm files.
-  option(ENABLE_BIGINT "Enable wasm BigInt support" OFF)
+  option(ENABLE_BIGINT "Enable wasm BigInt support" ON)
   if(ENABLE_BIGINT)
     add_link_flag("-sWASM_BIGINT")
    else()
     add_link_flag("-sWASM_BIGINT=0")
   endif()
+
+
 
   if("${CMAKE_BUILD_TYPE}" MATCHES "Release")
     # Extra check that cmake has set -O3 in its release flags.
@@ -358,6 +360,10 @@ if(EMSCRIPTEN)
     # in opt builds, LTO helps so much (>20%) it's worth slow compile times
     add_nondebug_compile_flag("-flto")
   endif()
+  add_link_flag("--profiling")
+  add_link_flag("-sMALLOC=mimalloc")
+  add_link_flag("-Wl,--no-merge-data-segments")
+  add_link_flag("-Wl,--emit-relocs")
   if(EMSCRIPTEN_ENABLE_WASM64)
     add_compile_flag("-sMEMORY64 -Wno-experimental")
     add_link_flag("-sMEMORY64")
