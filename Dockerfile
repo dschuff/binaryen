@@ -3,13 +3,12 @@ FROM ubuntu:noble
 
 RUN \
   apt-get update && \
-    apt-get install -y build-essential cmake python3 curl nodejs ninja-build git python3-pip
+    apt-get install -y build-essential cmake python3 curl ninja-build git python3-pip
 
-# Add source for nodejs,
-# see https://nodejs.org/en/download/package-manager/#debian-and-ubuntu-based-linux-distributions
-# RUN curl -sL https://deb.nodesource.com/setup_8.x | sudo -E bash -
-# RUN apt-get install nodejs
-
+# Download and install nvm:
+RUN curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.2/install.sh | bash
+# Download and install Node.js:
+RUN nvm install 23
 
 
 COPY . /test
