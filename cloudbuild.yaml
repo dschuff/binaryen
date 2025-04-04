@@ -1,11 +1,15 @@
 steps:
-  - name: 'docker'
+  - id: 'Set Up and Build'
+    name: 'docker'
     args: ['build', '-t', 'gcr.io/$PROJECT_ID/cb', '.']
-  - name: 'docker'
+  - id: 'Show files'
+    name: 'docker'
     args: ['run', 'gcr.io/$PROJECT_ID/cb', 'ls', '-R']
-  - name: 'docker'
+  - id: 'Lit test'
+    name: 'docker'
     args: ['run', 'gcr.io/$PROJECT_ID/cb', 'python3', 'out/bin/binaryen-lit', 'test/lit/parse-error.wast']
-  - name: 'docker'
+  - id: 'Check.py'
+    name: 'docker'
     args: ['run', 'gcr.io/$PROJECT_ID/cb', 'python3', 'check.py', '--binaryen-bin=out/bin']
 options:
   machineType: 'E2_HIGHCPU_8'
