@@ -20,9 +20,11 @@
 #include <cmath>
 
 #include "emscripten-optimizer/simple_ast.h"
+#include "fp16.h"
 #include "ir/bits.h"
 #include "pretty_printing.h"
 #include "support/bits.h"
+#include "support/string.h"
 #include "support/utilities.h"
 
 namespace wasm {
@@ -56,7 +58,7 @@ Literal::Literal(Type type) : type(type) {
     return;
   }
 
-  if (type.isRef() && type.getHeapType() == HeapType::i31) {
+  if (type.isRef() && type.getHeapType().isMaybeShared(HeapType::i31)) {
     assert(type.isNonNullable());
     i32 = 0;
     return;
@@ -72,19 +74,32 @@ Literal::Literal(const uint8_t init[16]) : type(Type::v128) {
 Literal::Literal(std::shared_ptr<GCData> gcData, HeapType type)
   : gcData(gcData), type(type, gcData ? NonNullable : Nullable) {
   // The type must be a proper type for GC data: either a struct, array, or
-  // string; or an externalized version of the same; or a null.
-  assert((isData() && gcData) || (type == HeapType::ext && gcData) ||
-         (type.isBottom() && !gcData));
+  // string; or an externalized version of the same; or a null; or an
+  // internalized string (which appears as an anyref).
+  assert((isData() && gcData) ||
+         (type.isMaybeShared(HeapType::ext) && gcData) ||
+         (type.isBottom() && !gcData) ||
+         (type.isMaybeShared(HeapType::any) && gcData &&
+          gcData->type.isMaybeShared(HeapType::string)));
 }
 
-Literal::Literal(std::string string)
+Literal::Literal(std::shared_ptr<ExnData> exnData)
+  : exnData(exnData), type(HeapType::exn, NonNullable) {
+  // The data must not be null.
+  assert(exnData);
+}
+
+Literal::Literal(std::string_view string)
   : gcData(nullptr), type(Type(HeapType::string, NonNullable)) {
   // TODO: we could in theory internalize strings
+  // Extract individual WTF-16LE code units.
   Literals contents;
-  for (auto c : string) {
-    contents.push_back(Literal(int32_t(c)));
+  assert(string.size() % 2 == 0);
+  for (size_t i = 0; i < string.size(); i += 2) {
+    int32_t u = uint8_t(string[i]) | (uint8_t(string[i + 1]) << 8);
+    contents.push_back(Literal(u));
   }
-  gcData = std::make_shared<GCData>(HeapType::string, contents);
+  gcData = std::make_shared<GCData>(HeapType::string, std::move(contents));
 }
 
 Literal::Literal(const Literal& other) : type(other.type) {
@@ -111,7 +126,11 @@ Literal::Literal(const Literal& other) : type(other.type) {
     new (&gcData) std::shared_ptr<GCData>();
     return;
   }
-  if (other.isData() || other.type.getHeapType() == HeapType::ext) {
+  // After handling nulls, only non-nullable Literals remain.
+  assert(!type.isNullable());
+
+  auto heapType = type.getHeapType();
+  if (other.isData() || heapType.isMaybeShared(HeapType::ext)) {
     new (&gcData) std::shared_ptr<GCData>(other.gcData);
     return;
   }
@@ -119,34 +138,35 @@ Literal::Literal(const Literal& other) : type(other.type) {
     func = other.func;
     return;
   }
-  if (type.isRef()) {
-    assert(!type.isNullable());
-    auto heapType = type.getHeapType();
-    if (heapType.isBasic()) {
-      switch (heapType.getBasic()) {
-        case HeapType::i31:
-          i32 = other.i32;
-          return;
-        case HeapType::ext:
-          gcData = other.gcData;
-          return;
-        case HeapType::none:
-        case HeapType::noext:
-        case HeapType::nofunc:
-          WASM_UNREACHABLE("null literals should already have been handled");
-        case HeapType::any:
-        case HeapType::eq:
-        case HeapType::func:
-        case HeapType::struct_:
-        case HeapType::array:
-          WASM_UNREACHABLE("invalid type");
-        case HeapType::string:
-        case HeapType::stringview_wtf8:
-        case HeapType::stringview_wtf16:
-        case HeapType::stringview_iter:
-          WASM_UNREACHABLE("TODO: string literals");
-      }
-    }
+  switch (heapType.getBasic(Unshared)) {
+    case HeapType::i31:
+      i32 = other.i32;
+      return;
+    case HeapType::exn:
+      new (&exnData) std::shared_ptr<ExnData>(other.exnData);
+      return;
+    case HeapType::ext:
+      WASM_UNREACHABLE("handled above with isData()");
+    case HeapType::none:
+    case HeapType::noext:
+    case HeapType::nofunc:
+    case HeapType::noexn:
+    case HeapType::nocont:
+      WASM_UNREACHABLE("null literals should already have been handled");
+    case HeapType::any:
+      // This must be an anyref literal, which is an internalized string.
+      assert(other.gcData &&
+             other.gcData->type.isMaybeShared(HeapType::string));
+      new (&gcData) std::shared_ptr<GCData>(other.gcData);
+      return;
+    case HeapType::eq:
+    case HeapType::func:
+    case HeapType::cont:
+    case HeapType::struct_:
+    case HeapType::array:
+      WASM_UNREACHABLE("invalid type");
+    case HeapType::string:
+      WASM_UNREACHABLE("TODO: string literals");
   }
 }
 
@@ -155,8 +175,11 @@ Literal::~Literal() {
   if (type.isBasic()) {
     return;
   }
-  if (isNull() || isData() || type.getHeapType() == HeapType::ext) {
+  if (isNull() || isData() || type.getHeapType().isMaybeShared(HeapType::ext) ||
+      type.getHeapType().isMaybeShared(HeapType::any)) {
     gcData.~shared_ptr();
+  } else if (isExn()) {
+    exnData.~shared_ptr();
   }
 }
 
@@ -280,24 +303,6 @@ Literal Literal::makeFromMemory(void* p, Type type) {
   }
 }
 
-Literal Literal::makeFromMemory(void* p, const Field& field) {
-  switch (field.packedType) {
-    case Field::not_packed:
-      return makeFromMemory(p, field.type);
-    case Field::i8: {
-      int8_t i;
-      memcpy(&i, p, sizeof(i));
-      return Literal(int32_t(i));
-    }
-    case Field::i16: {
-      int16_t i;
-      memcpy(&i, p, sizeof(i));
-      return Literal(int32_t(i));
-    }
-  }
-  WASM_UNREACHABLE("unexpected type");
-}
-
 Literal Literal::standardizeNaN(const Literal& input) {
   if (!std::isnan(input.getFloat())) {
     return input;
@@ -322,6 +327,12 @@ std::array<uint8_t, 16> Literal::getv128() const {
 std::shared_ptr<GCData> Literal::getGCData() const {
   assert(isNull() || isData());
   return gcData;
+}
+
+std::shared_ptr<ExnData> Literal::getExnData() const {
+  assert(isExn());
+  assert(exnData);
+  return exnData;
 }
 
 Literal Literal::castToF32() {
@@ -439,8 +450,12 @@ bool Literal::operator==(const Literal& other) const {
     if (type.isData()) {
       return gcData == other.gcData;
     }
-    if (type.getHeapType() == HeapType::i31) {
+    assert(type.getHeapType().isBasic());
+    if (type.getHeapType().isMaybeShared(HeapType::i31)) {
       return i32 == other.i32;
+    }
+    if (type.getHeapType().isMaybeShared(HeapType::ext)) {
+      return internalize() == other.internalize();
     }
     WASM_UNREACHABLE("unexpected type");
   }
@@ -460,6 +475,22 @@ bool Literal::isNaN() {
   }
   // TODO: SIMD?
   return false;
+}
+
+bool Literal::isCanonicalNaN() {
+  if (!isNaN()) {
+    return false;
+  }
+  return (type == Type::f32 && NaNPayload(getf32()) == (1u << 23) - 1) ||
+         (type == Type::f64 && NaNPayload(getf64()) == (1ull << 52) - 1);
+}
+
+bool Literal::isArithmeticNaN() {
+  if (!isNaN()) {
+    return false;
+  }
+  return (type == Type::f32 && NaNPayload(getf32()) > (1u << 23) - 1) ||
+         (type == Type::f64 && NaNPayload(getf64()) > (1ull << 52) - 1);
 }
 
 uint32_t Literal::NaNPayload(float f) {
@@ -540,7 +571,36 @@ void Literal::printVec128(std::ostream& o, const std::array<uint8_t, 16>& v) {
   o << std::dec;
 }
 
+// Printing literals is mainly for debugging purposes, and they can be of
+// massive size or even infinitely recursive, so abbreviate past some point.
+// We do so by tracking how much we've printed so far, and whether we are the
+// "toplevel" call (the entry point from somewhere else), and we reset the
+// count when we leave the toplevel call.
+namespace {
+struct PrintLimiter {
+  static const size_t PRINT_LIMIT = 100;
+  static thread_local size_t printed;
+
+  bool isTopLevel;
+
+  PrintLimiter() : isTopLevel(printed == 0) { printed++; }
+
+  ~PrintLimiter() {
+    if (isTopLevel) {
+      printed = 0;
+    }
+  }
+
+  bool stop() { return printed >= PRINT_LIMIT; }
+};
+
+thread_local size_t PrintLimiter::printed = 0;
+
+} // namespace
+
 std::ostream& operator<<(std::ostream& o, Literal literal) {
+  PrintLimiter limiter;
+
   prepareMinorColor(o);
   assert(literal.type.isSingle());
   if (literal.type.isBasic()) {
@@ -570,8 +630,11 @@ std::ostream& operator<<(std::ostream& o, Literal literal) {
   } else {
     assert(literal.type.isRef());
     auto heapType = literal.type.getHeapType();
+    if (heapType.isShared()) {
+      o << "shared ";
+    }
     if (heapType.isBasic()) {
-      switch (heapType.getBasic()) {
+      switch (heapType.getBasic(Unshared)) {
         case HeapType::i31:
           o << "i31ref(" << literal.geti31() << ")";
           break;
@@ -584,33 +647,48 @@ std::ostream& operator<<(std::ostream& o, Literal literal) {
         case HeapType::nofunc:
           o << "nullfuncref";
           break;
+        case HeapType::noexn:
+          o << "nullexnref";
+          break;
+        case HeapType::nocont:
+          o << "nullcontref";
+          break;
         case HeapType::ext:
           o << "externref";
           break;
-        case HeapType::any:
+        case HeapType::exn:
+          o << "exnref";
+          break;
         case HeapType::eq:
         case HeapType::func:
+        case HeapType::cont:
         case HeapType::struct_:
         case HeapType::array:
           WASM_UNREACHABLE("invalid type");
+        case HeapType::any:
+          // Anyref literals contain strings.
         case HeapType::string: {
           auto data = literal.getGCData();
           if (!data) {
             o << "nullstring";
           } else {
-            o << "string(\"";
+            o << "string(";
+            // Convert WTF-16 literals to WTF-16 string.
+            std::stringstream wtf16;
             for (auto c : data->values) {
-              // TODO: more than ascii
-              o << char(c.getInteger());
+              auto u = c.getInteger();
+              assert(u < 0x10000);
+              wtf16 << uint8_t(u & 0xFF);
+              wtf16 << uint8_t(u >> 8);
             }
-            o << "\")";
+            // Escape to ensure we have valid unicode output and to make
+            // unprintable characters visible.
+            // TODO: Use wtf16.view() once we have C++20.
+            String::printEscapedJSON(o, wtf16.str());
+            o << ")";
           }
           break;
         }
-        case HeapType::stringview_wtf8:
-        case HeapType::stringview_wtf16:
-        case HeapType::stringview_iter:
-          WASM_UNREACHABLE("TODO: string literals");
       }
     } else if (heapType.isSignature()) {
       o << "funcref(" << literal.getFunc() << ")";
@@ -626,18 +704,31 @@ std::ostream& operator<<(std::ostream& o, Literal literal) {
 }
 
 std::ostream& operator<<(std::ostream& o, wasm::Literals literals) {
+  PrintLimiter limiter;
+
+  if (limiter.stop()) {
+    return o << "[..]";
+  }
+
   if (literals.size() == 1) {
     return o << literals[0];
-  } else {
-    o << '(';
-    if (literals.size() > 0) {
-      o << literals[0];
-    }
-    for (size_t i = 1; i < literals.size(); ++i) {
-      o << ", " << literals[i];
-    }
-    return o << ')';
   }
+
+  o << '(';
+  bool first = true;
+  for (auto& literal : literals) {
+    if (limiter.stop()) {
+      o << "[..]";
+      break;
+    }
+    if (first) {
+      first = false;
+    } else {
+      o << ", ";
+    }
+    o << literal;
+  }
+  return o << ')';
 }
 
 Literal Literal::countLeadingZeroes() const {
@@ -717,6 +808,20 @@ Literal Literal::wrapToI32() const {
   return Literal((int32_t)i64);
 }
 
+Literal Literal::convertSIToF16() const {
+  if (type == Type::i32) {
+    return Literal(fp16_ieee_from_fp32_value(float(i32)));
+  }
+  WASM_UNREACHABLE("invalid type");
+}
+
+Literal Literal::convertUIToF16() const {
+  if (type == Type::i32) {
+    return Literal(fp16_ieee_from_fp32_value(float(uint16_t(i32))));
+  }
+  WASM_UNREACHABLE("invalid type");
+}
+
 Literal Literal::convertSIToF32() const {
   if (type == Type::i32) {
     return Literal(float(i32));
@@ -757,6 +862,10 @@ Literal Literal::convertUIToF64() const {
   WASM_UNREACHABLE("invalid type");
 }
 
+Literal Literal::convertF32ToF16() const {
+  return Literal(fp16_ieee_from_fp32_value(getf32()));
+}
+
 template<typename F> struct AsInt { using type = void; };
 template<> struct AsInt<float> { using type = int32_t; };
 template<> struct AsInt<double> { using type = int64_t; };
@@ -774,6 +883,14 @@ static Literal saturating_trunc(typename AsInt<F>::type val) {
     }
   }
   return Literal(I(std::trunc(bit_cast<F>(val))));
+}
+
+Literal Literal::truncSatToSI16() const {
+  if (type == Type::f32) {
+    return saturating_trunc<float, int16_t, isInRangeI16TruncS>(
+      Literal(*this).castToI32().geti32());
+  }
+  WASM_UNREACHABLE("invalid type");
 }
 
 Literal Literal::truncSatToSI32() const {
@@ -796,6 +913,14 @@ Literal Literal::truncSatToSI64() const {
   if (type == Type::f64) {
     return saturating_trunc<double, int64_t, isInRangeI64TruncS>(
       Literal(*this).castToI64().geti64());
+  }
+  WASM_UNREACHABLE("invalid type");
+}
+
+Literal Literal::truncSatToUI16() const {
+  if (type == Type::f32) {
+    return saturating_trunc<float, uint16_t, isInRangeI16TruncU>(
+      Literal(*this).castToI32().geti32());
   }
   WASM_UNREACHABLE("invalid type");
 }
@@ -863,8 +988,14 @@ Literal Literal::neg() const {
 Literal Literal::abs() const {
   switch (type.getBasic()) {
     case Type::i32:
+      if (i32 == std::numeric_limits<int32_t>::min()) {
+        return *this;
+      }
       return Literal(std::abs(i32));
     case Type::i64:
+      if (i64 == std::numeric_limits<int64_t>::min()) {
+        return *this;
+      }
       return Literal(std::abs(i64));
     case Type::f32:
       return Literal(i32 & 0x7fffffff).castToF32();
@@ -1484,8 +1615,12 @@ Literal Literal::min(const Literal& other) const {
       if (std::isnan(r)) {
         return standardizeNaN(Literal(r));
       }
+      // This code is written in a form that avoids a gcc 13 bug, see
+      // https://gcc.gnu.org/bugzilla/show_bug.cgi?id=111694
       if (l == r && l == 0) {
-        return Literal(std::signbit(l) ? l : r);
+        auto lSigned = std::signbit(l);
+        auto rSigned = std::signbit(r);
+        return Literal(lSigned || rSigned ? -0.0f : 0.0f);
       }
       return Literal(std::min(l, r));
     }
@@ -1498,7 +1633,9 @@ Literal Literal::min(const Literal& other) const {
         return standardizeNaN(Literal(r));
       }
       if (l == r && l == 0) {
-        return Literal(std::signbit(l) ? l : r);
+        auto lSigned = std::signbit(l);
+        auto rSigned = std::signbit(r);
+        return Literal(lSigned || rSigned ? -0.0 : 0.0);
       }
       return Literal(std::min(l, r));
     }
@@ -1518,7 +1655,9 @@ Literal Literal::max(const Literal& other) const {
         return standardizeNaN(Literal(r));
       }
       if (l == r && l == 0) {
-        return Literal(std::signbit(l) ? r : l);
+        auto lSigned = std::signbit(l);
+        auto rSigned = std::signbit(r);
+        return Literal(lSigned && rSigned ? -0.0f : 0.0f);
       }
       return Literal(std::max(l, r));
     }
@@ -1531,7 +1670,9 @@ Literal Literal::max(const Literal& other) const {
         return standardizeNaN(Literal(r));
       }
       if (l == r && l == 0) {
-        return Literal(std::signbit(l) ? r : l);
+        auto lSigned = std::signbit(l);
+        auto rSigned = std::signbit(r);
+        return Literal(lSigned && rSigned ? -0.0 : 0.0);
       }
       return Literal(std::max(l, r));
     }
@@ -1576,26 +1717,28 @@ Literal Literal::copysign(const Literal& other) const {
   }
 }
 
-Literal Literal::fma(const Literal& left, const Literal& right) const {
+Literal Literal::madd(const Literal& left, const Literal& right) const {
   switch (type.getBasic()) {
     case Type::f32:
-      return Literal(::fmaf(left.getf32(), right.getf32(), getf32()));
+      return Literal(::fmaf(getf32(), left.getf32(), right.getf32()));
       break;
     case Type::f64:
-      return Literal(::fma(left.getf64(), right.getf64(), getf64()));
+      return Literal(::fma(getf64(), left.getf64(), right.getf64()));
       break;
     default:
       WASM_UNREACHABLE("unexpected type");
   }
 }
 
-Literal Literal::fms(const Literal& left, const Literal& right) const {
+// XXX: This is not an actual fused negated multiply implementation, but
+// the relaxed spec allows a double rounding implementation like below.
+Literal Literal::nmadd(const Literal& left, const Literal& right) const {
   switch (type.getBasic()) {
     case Type::f32:
-      return Literal(::fmaf(-left.getf32(), right.getf32(), getf32()));
+      return Literal(-(getf32() * left.getf32()) + right.getf32());
       break;
     case Type::f64:
-      return Literal(::fma(-left.getf64(), right.getf64(), getf64()));
+      return Literal(-(getf64() * left.getf64()) + right.getf64());
       break;
     default:
       WASM_UNREACHABLE("unexpected type");
@@ -1637,6 +1780,13 @@ LaneArray<4> Literal::getLanesI32x4() const {
 LaneArray<2> Literal::getLanesI64x2() const {
   return getLanes<int64_t, 2>(*this);
 }
+LaneArray<8> Literal::getLanesF16x8() const {
+  auto lanes = getLanesUI16x8();
+  for (size_t i = 0; i < lanes.size(); ++i) {
+    lanes[i] = Literal(fp16_ieee_to_fp32_value(lanes[i].geti32()));
+  }
+  return lanes;
+}
 LaneArray<4> Literal::getLanesF32x4() const {
   auto lanes = getLanesI32x4();
   for (size_t i = 0; i < lanes.size(); ++i) {
@@ -1674,6 +1824,9 @@ Literal Literal::splatI8x16() const { return splat<Type::i32, 16>(*this); }
 Literal Literal::splatI16x8() const { return splat<Type::i32, 8>(*this); }
 Literal Literal::splatI32x4() const { return splat<Type::i32, 4>(*this); }
 Literal Literal::splatI64x2() const { return splat<Type::i64, 2>(*this); }
+Literal Literal::splatF16x8() const {
+  return splat<Type::i32, 8>(convertF32ToF16());
+}
 Literal Literal::splatF32x4() const { return splat<Type::f32, 4>(*this); }
 Literal Literal::splatF64x2() const { return splat<Type::f64, 2>(*this); }
 
@@ -1694,6 +1847,9 @@ Literal Literal::extractLaneI32x4(uint8_t index) const {
 }
 Literal Literal::extractLaneI64x2(uint8_t index) const {
   return getLanesI64x2().at(index);
+}
+Literal Literal::extractLaneF16x8(uint8_t index) const {
+  return getLanesF16x8().at(index);
 }
 Literal Literal::extractLaneF32x4(uint8_t index) const {
   return getLanesF32x4().at(index);
@@ -1723,6 +1879,13 @@ Literal Literal::replaceLaneI32x4(const Literal& other, uint8_t index) const {
 Literal Literal::replaceLaneI64x2(const Literal& other, uint8_t index) const {
   return replace<2, &Literal::getLanesI64x2>(*this, other, index);
 }
+Literal Literal::replaceLaneF16x8(const Literal& other, uint8_t index) const {
+  // For F16 lane replacement we do not need to convert all the values to F32,
+  // instead keep the lanes as I32, and just replace the one lane with the
+  // integer value of the F32.
+  return replace<8, &Literal::getLanesUI16x8>(
+    *this, other.convertF32ToF16(), index);
+}
 Literal Literal::replaceLaneF32x4(const Literal& other, uint8_t index) const {
   return replace<4, &Literal::getLanesF32x4>(*this, other, index);
 }
@@ -1730,13 +1893,19 @@ Literal Literal::replaceLaneF64x2(const Literal& other, uint8_t index) const {
   return replace<2, &Literal::getLanesF64x2>(*this, other, index);
 }
 
+static Literal passThrough(const Literal& literal) { return literal; }
+static Literal toFP16(const Literal& literal) {
+  return literal.convertF32ToF16();
+}
+
 template<int Lanes,
          LaneArray<Lanes> (Literal::*IntoLanes)() const,
-         Literal (Literal::*UnaryOp)(void) const>
+         Literal (Literal::*UnaryOp)(void) const,
+         Literal (*Convert)(const Literal&) = passThrough>
 static Literal unary(const Literal& val) {
   LaneArray<Lanes> lanes = (val.*IntoLanes)();
   for (size_t i = 0; i < Lanes; ++i) {
-    lanes[i] = (lanes[i].*UnaryOp)();
+    lanes[i] = Convert((lanes[i].*UnaryOp)());
   }
   return Literal(lanes);
 }
@@ -1772,6 +1941,27 @@ Literal Literal::negI32x4() const {
 }
 Literal Literal::negI64x2() const {
   return unary<2, &Literal::getLanesI64x2, &Literal::neg>(*this);
+}
+Literal Literal::absF16x8() const {
+  return unary<8, &Literal::getLanesF16x8, &Literal::abs, &toFP16>(*this);
+}
+Literal Literal::negF16x8() const {
+  return unary<8, &Literal::getLanesF16x8, &Literal::neg, &toFP16>(*this);
+}
+Literal Literal::sqrtF16x8() const {
+  return unary<8, &Literal::getLanesF16x8, &Literal::sqrt, &toFP16>(*this);
+}
+Literal Literal::ceilF16x8() const {
+  return unary<8, &Literal::getLanesF16x8, &Literal::ceil, &toFP16>(*this);
+}
+Literal Literal::floorF16x8() const {
+  return unary<8, &Literal::getLanesF16x8, &Literal::floor, &toFP16>(*this);
+}
+Literal Literal::truncF16x8() const {
+  return unary<8, &Literal::getLanesF16x8, &Literal::trunc, &toFP16>(*this);
+}
+Literal Literal::nearestF16x8() const {
+  return unary<8, &Literal::getLanesF16x8, &Literal::nearbyint, &toFP16>(*this);
 }
 Literal Literal::absF32x4() const {
   return unary<4, &Literal::getLanesF32x4, &Literal::abs>(*this);
@@ -1851,6 +2041,19 @@ Literal Literal::convertSToF32x4() const {
 }
 Literal Literal::convertUToF32x4() const {
   return unary<4, &Literal::getLanesI32x4, &Literal::convertUIToF32>(*this);
+}
+
+Literal Literal::truncSatToSI16x8() const {
+  return unary<8, &Literal::getLanesF16x8, &Literal::truncSatToSI16>(*this);
+}
+Literal Literal::truncSatToUI16x8() const {
+  return unary<8, &Literal::getLanesF16x8, &Literal::truncSatToUI16>(*this);
+}
+Literal Literal::convertSToF16x8() const {
+  return unary<8, &Literal::getLanesSI16x8, &Literal::convertSIToF16>(*this);
+}
+Literal Literal::convertUToF16x8() const {
+  return unary<8, &Literal::getLanesSI16x8, &Literal::convertUIToF16>(*this);
 }
 
 Literal Literal::anyTrueV128() const {
@@ -2098,6 +2301,24 @@ Literal Literal::geSI64x2(const Literal& other) const {
   return compare<2, &Literal::getLanesI64x2, &Literal::geS, int64_t>(*this,
                                                                      other);
 }
+Literal Literal::eqF16x8(const Literal& other) const {
+  return compare<8, &Literal::getLanesF16x8, &Literal::eq>(*this, other);
+}
+Literal Literal::neF16x8(const Literal& other) const {
+  return compare<8, &Literal::getLanesF16x8, &Literal::ne>(*this, other);
+}
+Literal Literal::ltF16x8(const Literal& other) const {
+  return compare<8, &Literal::getLanesF16x8, &Literal::lt>(*this, other);
+}
+Literal Literal::gtF16x8(const Literal& other) const {
+  return compare<8, &Literal::getLanesF16x8, &Literal::gt>(*this, other);
+}
+Literal Literal::leF16x8(const Literal& other) const {
+  return compare<8, &Literal::getLanesF16x8, &Literal::le>(*this, other);
+}
+Literal Literal::geF16x8(const Literal& other) const {
+  return compare<8, &Literal::getLanesF16x8, &Literal::ge>(*this, other);
+}
 Literal Literal::eqF32x4(const Literal& other) const {
   return compare<4, &Literal::getLanesF32x4, &Literal::eq>(*this, other);
 }
@@ -2143,12 +2364,13 @@ Literal Literal::geF64x2(const Literal& other) const {
 
 template<int Lanes,
          LaneArray<Lanes> (Literal::*IntoLanes)() const,
-         Literal (Literal::*BinaryOp)(const Literal&) const>
+         Literal (Literal::*BinaryOp)(const Literal&) const,
+         Literal (*Convert)(const Literal&) = passThrough>
 static Literal binary(const Literal& val, const Literal& other) {
   LaneArray<Lanes> lanes = (val.*IntoLanes)();
   LaneArray<Lanes> other_lanes = (other.*IntoLanes)();
   for (size_t i = 0; i < Lanes; ++i) {
-    lanes[i] = (lanes[i].*BinaryOp)(other_lanes[i]);
+    lanes[i] = Convert((lanes[i].*BinaryOp)(other_lanes[i]));
   }
   return Literal(lanes);
 }
@@ -2272,6 +2494,38 @@ Literal Literal::subI64x2(const Literal& other) const {
 }
 Literal Literal::mulI64x2(const Literal& other) const {
   return binary<2, &Literal::getLanesI64x2, &Literal::mul>(*this, other);
+}
+Literal Literal::addF16x8(const Literal& other) const {
+  return binary<8, &Literal::getLanesF16x8, &Literal::add, &toFP16>(*this,
+                                                                    other);
+}
+Literal Literal::subF16x8(const Literal& other) const {
+  return binary<8, &Literal::getLanesF16x8, &Literal::sub, &toFP16>(*this,
+                                                                    other);
+}
+Literal Literal::mulF16x8(const Literal& other) const {
+  return binary<8, &Literal::getLanesF16x8, &Literal::mul, &toFP16>(*this,
+                                                                    other);
+}
+Literal Literal::divF16x8(const Literal& other) const {
+  return binary<8, &Literal::getLanesF16x8, &Literal::div, &toFP16>(*this,
+                                                                    other);
+}
+Literal Literal::minF16x8(const Literal& other) const {
+  return binary<8, &Literal::getLanesF16x8, &Literal::min, &toFP16>(*this,
+                                                                    other);
+}
+Literal Literal::maxF16x8(const Literal& other) const {
+  return binary<8, &Literal::getLanesF16x8, &Literal::max, &toFP16>(*this,
+                                                                    other);
+}
+Literal Literal::pminF16x8(const Literal& other) const {
+  return binary<8, &Literal::getLanesF16x8, &Literal::pmin, &toFP16>(*this,
+                                                                     other);
+}
+Literal Literal::pmaxF16x8(const Literal& other) const {
+  return binary<8, &Literal::getLanesF16x8, &Literal::pmax, &toFP16>(*this,
+                                                                     other);
 }
 Literal Literal::addF32x4(const Literal& other) const {
   return binary<4, &Literal::getLanesF32x4, &Literal::add>(*this, other);
@@ -2559,73 +2813,92 @@ Literal Literal::swizzleI8x16(const Literal& other) const {
 namespace {
 template<int Lanes,
          LaneArray<Lanes> (Literal::*IntoLanes)() const,
-         Literal (Literal::*TernaryOp)(const Literal&, const Literal&) const>
+         Literal (Literal::*TernaryOp)(const Literal&, const Literal&) const,
+         Literal (*Convert)(const Literal&) = passThrough>
 static Literal ternary(const Literal& a, const Literal& b, const Literal& c) {
   LaneArray<Lanes> x = (a.*IntoLanes)();
   LaneArray<Lanes> y = (b.*IntoLanes)();
   LaneArray<Lanes> z = (c.*IntoLanes)();
   LaneArray<Lanes> r;
   for (size_t i = 0; i < Lanes; ++i) {
-    r[i] = (x[i].*TernaryOp)(y[i], z[i]);
+    r[i] = Convert((x[i].*TernaryOp)(y[i], z[i]));
   }
   return Literal(r);
 }
 } // namespace
 
-Literal Literal::relaxedFmaF32x4(const Literal& left,
-                                 const Literal& right) const {
-  return ternary<4, &Literal::getLanesF32x4, &Literal::fma>(*this, left, right);
+Literal Literal::relaxedMaddF16x8(const Literal& left,
+                                  const Literal& right) const {
+  return ternary<8, &Literal::getLanesF16x8, &Literal::madd, &toFP16>(
+    *this, left, right);
 }
 
-Literal Literal::relaxedFmsF32x4(const Literal& left,
-                                 const Literal& right) const {
-  return ternary<4, &Literal::getLanesF32x4, &Literal::fms>(*this, left, right);
+Literal Literal::relaxedNmaddF16x8(const Literal& left,
+                                   const Literal& right) const {
+  return ternary<8, &Literal::getLanesF16x8, &Literal::nmadd, &toFP16>(
+    *this, left, right);
 }
 
-Literal Literal::relaxedFmaF64x2(const Literal& left,
-                                 const Literal& right) const {
-  return ternary<2, &Literal::getLanesF64x2, &Literal::fma>(*this, left, right);
+Literal Literal::relaxedMaddF32x4(const Literal& left,
+                                  const Literal& right) const {
+  return ternary<4, &Literal::getLanesF32x4, &Literal::madd>(
+    *this, left, right);
 }
 
-Literal Literal::relaxedFmsF64x2(const Literal& left,
-                                 const Literal& right) const {
-  return ternary<2, &Literal::getLanesF64x2, &Literal::fms>(*this, left, right);
+Literal Literal::relaxedNmaddF32x4(const Literal& left,
+                                   const Literal& right) const {
+  return ternary<4, &Literal::getLanesF32x4, &Literal::nmadd>(
+    *this, left, right);
+}
+
+Literal Literal::relaxedMaddF64x2(const Literal& left,
+                                  const Literal& right) const {
+  return ternary<2, &Literal::getLanesF64x2, &Literal::madd>(
+    *this, left, right);
+}
+
+Literal Literal::relaxedNmaddF64x2(const Literal& left,
+                                   const Literal& right) const {
+  return ternary<2, &Literal::getLanesF64x2, &Literal::nmadd>(
+    *this, left, right);
 }
 
 Literal Literal::externalize() const {
-  assert(Type::isSubType(type, Type(HeapType::any, Nullable)) &&
+  assert(type.isRef() && type.getHeapType().getUnsharedTop() == HeapType::any &&
          "can only externalize internal references");
+  auto share = type.getHeapType().getShared();
   if (isNull()) {
-    return Literal(std::shared_ptr<GCData>{}, HeapType::noext);
+    return Literal(std::shared_ptr<GCData>{}, HeapTypes::noext.getBasic(share));
   }
   auto heapType = type.getHeapType();
-  if (heapType.isBasic()) {
-    switch (heapType.getBasic()) {
-      case HeapType::i31: {
-        return Literal(std::make_shared<GCData>(HeapType::i31, Literals{*this}),
-                       HeapType::ext);
-      }
-      case HeapType::string:
-      case HeapType::stringview_wtf8:
-      case HeapType::stringview_wtf16:
-      case HeapType::stringview_iter:
-        WASM_UNREACHABLE("TODO: string literals");
-      default:
-        WASM_UNREACHABLE("unexpected type");
-    }
+  auto extType = HeapTypes::ext.getBasic(share);
+  if (heapType.isMaybeShared(HeapType::i31)) {
+    return Literal(std::make_shared<GCData>(heapType, Literals{*this}),
+                   extType);
   }
-  return Literal(gcData, HeapType::ext);
+  if (heapType.isMaybeShared(HeapType::any)) {
+    // Anyref literals turn into strings (if we add any other anyref literals,
+    // we will need to be more careful here).
+    return Literal(gcData, HeapTypes::string.getBasic(share));
+  }
+  return Literal(gcData, extType);
 }
 
 Literal Literal::internalize() const {
-  assert(Type::isSubType(type, Type(HeapType::ext, Nullable)) &&
-         "can only internalize external references");
+  auto share = type.getHeapType().getShared();
+  assert(
+    Type::isSubType(type, Type(HeapTypes::ext.getBasic(share), Nullable)) &&
+    "can only internalize external references");
   if (isNull()) {
-    return Literal(std::shared_ptr<GCData>{}, HeapType::none);
+    return Literal(std::shared_ptr<GCData>{}, HeapTypes::none.getBasic(share));
   }
-  if (gcData->type == HeapType::i31) {
-    assert(gcData->values[0].type.getHeapType() == HeapType::i31);
+  if (gcData->type.isMaybeShared(HeapType::i31)) {
+    assert(gcData->values[0].type.getHeapType().isMaybeShared(HeapType::i31));
     return gcData->values[0];
+  }
+  if (gcData->type.isMaybeShared(HeapType::string)) {
+    // Strings turn into anyref literals.
+    return Literal(gcData, HeapTypes::any.getBasic(share));
   }
   return Literal(gcData, gcData->type);
 }

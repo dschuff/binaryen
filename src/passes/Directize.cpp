@@ -33,6 +33,8 @@
 #include <unordered_map>
 
 #include "call-utils.h"
+#include "ir/drop.h"
+#include "ir/find_all.h"
 #include "ir/table-utils.h"
 #include "ir/utils.h"
 #include "pass.h"
@@ -128,7 +130,7 @@ private:
       return CallUtils::Unknown{};
     }
 
-    Index index = c->value.geti32();
+    Address index = c->value.getUnsigned();
 
     // Check if index is invalid, or the type is wrong.
     auto& flatTable = *table.flatTable;
@@ -170,12 +172,18 @@ private:
       // We don't know anything here.
       return;
     }
-    // If the index is invalid, or the type is wrong, we can
-    // emit an unreachable here, since in Binaryen it is ok to
-    // reorder/replace traps when optimizing (but never to
+    // If the index is invalid, or the type is wrong, we can skip the call and
+    // emit an unreachable here (with dropped children as needed), since in
+    // Binaryen it is ok to reorder/replace traps when optimizing (but never to
     // remove them, at least not by default).
     if (std::get_if<CallUtils::Trap>(&info)) {
-      replaceCurrent(replaceWithUnreachable(operands));
+      replaceCurrent(
+        getDroppedChildrenAndAppend(original,
+                                    *getModule(),
+                                    getPassOptions(),
+                                    Builder(*getModule()).makeUnreachable(),
+                                    DropMode::IgnoreParentEffects));
+      changedTypes = true;
       return;
     }
 
@@ -184,19 +192,6 @@ private:
     replaceCurrent(
       Builder(*getModule())
         .makeCall(name, operands, original->type, original->isReturn));
-  }
-
-  Expression* replaceWithUnreachable(const std::vector<Expression*>& operands) {
-    // Emitting an unreachable means we must update parent types.
-    changedTypes = true;
-
-    Builder builder(*getModule());
-    std::vector<Expression*> newOperands;
-    for (auto* operand : operands) {
-      newOperands.push_back(builder.makeDrop(operand));
-    }
-    return builder.makeSequence(builder.makeBlock(newOperands),
-                                builder.makeUnreachable());
   }
 };
 
@@ -208,7 +203,7 @@ struct Directize : public Pass {
 
     // TODO: consider a per-table option here
     auto initialContentsImmutable =
-      getPassOptions().hasArgument("directize-initial-contents-immutable");
+      hasArgument("directize-initial-contents-immutable");
 
     // Set up the initial info.
     TableInfoMap tables;
@@ -228,7 +223,7 @@ struct Directize : public Pass {
 
     for (auto& ex : module->exports) {
       if (ex->kind == ExternalKind::Table) {
-        tables[ex->value].mayBeModified = true;
+        tables[*ex->getInternalName()].mayBeModified = true;
       }
     }
 
@@ -256,9 +251,27 @@ struct Directize : public Pass {
         if (func->imported()) {
           return;
         }
-        for (auto* set : FindAll<TableSet>(func->body).list) {
-          tablesWithSet.insert(set->table);
-        }
+
+        struct Finder : public PostWalker<Finder> {
+          TablesWithSet& tablesWithSet;
+
+          Finder(TablesWithSet& tablesWithSet) : tablesWithSet(tablesWithSet) {}
+
+          void visitTableSet(TableSet* curr) {
+            tablesWithSet.insert(curr->table);
+          }
+          void visitTableFill(TableFill* curr) {
+            tablesWithSet.insert(curr->table);
+          }
+          void visitTableCopy(TableCopy* curr) {
+            tablesWithSet.insert(curr->destTable);
+          }
+          void visitTableInit(TableInit* curr) {
+            tablesWithSet.insert(curr->table);
+          }
+        };
+
+        Finder(tablesWithSet).walkFunction(func);
       });
 
     for (auto& [_, names] : analysis.map) {

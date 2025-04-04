@@ -9,7 +9,7 @@ function preserveStack(func) {
 }
 
 function strToStack(str) {
-  return str ? allocateUTF8OnStack(str) : 0;
+  return str ? stringToUTF8OnStack(str) : 0;
 }
 
 function i32sToStack(i32s) {
@@ -40,9 +40,6 @@ function initializeConstants() {
     ['i31ref', 'I31ref'],
     ['structref', 'Structref'],
     ['stringref', 'Stringref'],
-    ['stringview_wtf8', 'StringviewWTF8'],
-    ['stringview_wtf16', 'StringviewWTF16'],
-    ['stringview_iter', 'StringviewIter'],
     ['unreachable', 'Unreachable'],
     ['auto', 'Auto']
   ].forEach(entry => {
@@ -105,7 +102,7 @@ function initializeConstants() {
     'TupleMake',
     'TupleExtract',
     'Pop',
-    'I31New',
+    'RefI31',
     'I31Get',
     'CallRef',
     'RefTest',
@@ -127,13 +124,8 @@ function initializeConstants() {
     'StringEncode',
     'StringConcat',
     'StringEq',
-    'StringAs',
-    'StringWTF8Advance',
     'StringWTF16Get',
-    'StringIterNext',
-    'StringIterMove',
     'StringSliceWTF',
-    'StringSliceIter'
   ].forEach(name => {
     Module['ExpressionIds'][name] = Module[name + 'Id'] = Module['_Binaryen' + name + 'Id']();
   });
@@ -153,11 +145,11 @@ function initializeConstants() {
   Module['Features'] = {};
   [ 'MVP',
     'Atomics',
-    'BulkMemory',
     'MutableGlobals',
     'NontrappingFPToInt',
-    'SignExt',
     'SIMD128',
+    'BulkMemory',
+    'SignExt',
     'ExceptionHandling',
     'TailCall',
     'ReferenceTypes',
@@ -167,7 +159,12 @@ function initializeConstants() {
     'RelaxedSIMD',
     'ExtendedConst',
     'Strings',
-    'MultiMemories',
+    'MultiMemory',
+    'StackSwitching',
+    'SharedEverything',
+    'FP16',
+    'BulkMemoryOpt',
+    'CallIndirectOverlong',
     'All'
   ].forEach(name => {
     Module['Features'][name] = Module['_BinaryenFeature' + name]();
@@ -391,10 +388,10 @@ function initializeConstants() {
     'XorVec128',
     'AndNotVec128',
     'BitselectVec128',
-    'RelaxedFmaVecF32x4',
-    'RelaxedFmsVecF32x4',
-    'RelaxedFmaVecF64x2',
-    'RelaxedFmsVecF64x2',
+    'RelaxedMaddVecF32x4',
+    'RelaxedNmaddVecF32x4',
+    'RelaxedMaddVecF64x2',
+    'RelaxedNmaddVecF64x2',
     'LaneselectI8x16',
     'LaneselectI16x8',
     'LaneselectI32x4',
@@ -572,37 +569,19 @@ function initializeConstants() {
     'RefAsNonNull',
     'RefAsExternInternalize',
     'RefAsExternExternalize',
+    'RefAsAnyConvertExtern',
+    'RefAsExternConvertAny',
     'BrOnNull',
     'BrOnNonNull',
     'BrOnCast',
     'BrOnCastFail',
-    'StringNewUTF8',
-    'StringNewWTF8',
-    'StringNewReplace',
-    'StringNewWTF16',
-    'StringNewUTF8Array',
-    'StringNewWTF8Array',
-    'StringNewReplaceArray',
+    'StringNewLossyUTF8Array',
     'StringNewWTF16Array',
     'StringNewFromCodePoint',
     'StringMeasureUTF8',
-    'StringMeasureWTF8',
     'StringMeasureWTF16',
-    'StringMeasureIsUSV',
-    'StringMeasureWTF16View',
-    'StringEncodeUTF8',
-    'StringEncodeWTF8',
-    'StringEncodeWTF16',
-    'StringEncodeUTF8Array',
-    'StringEncodeWTF8Array',
+    'StringEncodeLossyUTF8Array',
     'StringEncodeWTF16Array',
-    'StringAsWTF8',
-    'StringAsWTF16',
-    'StringAsIter',
-    'StringIterMoveAdvance',
-    'StringIterMoveRewind',
-    'StringSliceWTF8',
-    'StringSliceWTF16',
     'StringEqEqual',
     'StringEqCompare'
   ].forEach(name => {
@@ -636,7 +615,6 @@ function initializeConstants() {
   Module['ExpressionRunner']['Flags'] = {
     'Default': Module['_ExpressionRunnerFlagsDefault'](),
     'PreserveSideeffects': Module['_ExpressionRunnerFlagsPreserveSideeffects'](),
-    'TraverseCalls': Module['_ExpressionRunnerFlagsTraverseCalls']()
   };
 }
 
@@ -758,7 +736,7 @@ function wrapModule(module, self = {}) {
       return Module['_BinaryenMemoryGrow'](module, value, strToStack(name), memory64);
     },
     'init'(segment, dest, offset, size, name) {
-      return Module['_BinaryenMemoryInit'](module, segment, dest, offset, size, strToStack(name));
+      return preserveStack(() => Module['_BinaryenMemoryInit'](module, strToStack(segment), dest, offset, size, strToStack(name)));
     },
     'copy'(dest, source, size, destMemory, sourceMemory) {
       return Module['_BinaryenMemoryCopy'](module, dest, source, size, strToStack(destMemory), strToStack(sourceMemory));
@@ -781,7 +759,7 @@ function wrapModule(module, self = {}) {
 
   self['data'] = {
     'drop'(segment) {
-      return Module['_BinaryenDataDrop'](module, segment);
+      return preserveStack(() => Module['_BinaryenDataDrop'](module, strToStack(segment)));
     }
   }
 
@@ -2337,24 +2315,6 @@ function wrapModule(module, self = {}) {
     }
   };
 
-  self['stringview_wtf8'] = {
-    'pop'() {
-      return Module['_BinaryenPop'](module, Module['stringview_wtf8']);
-    }
-  };
-
-  self['stringview_wtf16'] = {
-    'pop'() {
-      return Module['_BinaryenPop'](module, Module['stringview_wtf16']);
-    }
-  };
-
-  self['stringview_iter'] = {
-    'pop'() {
-      return Module['_BinaryenPop'](module, Module['stringview_iter']);
-    }
-  };
-
   self['ref'] = {
     'null'(type) {
       return Module['_BinaryenRefNull'](module, type);
@@ -2368,13 +2328,16 @@ function wrapModule(module, self = {}) {
     'func'(func, type) {
       return preserveStack(() => Module['_BinaryenRefFunc'](module, strToStack(func), type));
     },
+    'i31'(value) {
+      return Module['_BinaryenRefI31'](module, value);
+    },
     'eq'(left, right) {
       return Module['_BinaryenRefEq'](module, left, right);
     }
   };
 
-  self['select'] = function(condition, ifTrue, ifFalse, type) {
-    return Module['_BinaryenSelect'](module, condition, ifTrue, ifFalse, typeof type !== 'undefined' ? type : Module['auto']);
+  self['select'] = function(condition, ifTrue, ifFalse) {
+    return Module['_BinaryenSelect'](module, condition, ifTrue, ifFalse);
   };
   self['drop'] = function(value) {
     return Module['_BinaryenDrop'](module, value);
@@ -2416,9 +2379,6 @@ function wrapModule(module, self = {}) {
   };
 
   self['i31'] = {
-    'new'(value) {
-      return Module['_BinaryenI31New'](module, value);
-    },
     'get_s'(i31) {
       return Module['_BinaryenI31Get'](module, i31, 1);
     },
@@ -2427,17 +2387,14 @@ function wrapModule(module, self = {}) {
     }
   };
 
-  // TODO: extern.internalize
-  // TODO: extern.externalize
+  // TODO: any.convert_extern
+  // TODO: extern.convert_any
   // TODO: ref.test
   // TODO: ref.cast
   // TODO: br_on_*
   // TODO: struct.*
   // TODO: array.*
   // TODO: string.*
-  // TODO: stringview_wtf8.*
-  // TODO: stringview_wtf16.*
-  // TODO: stringview_iter.*
 
   // 'Module' operations
   self['addFunction'] = function(name, params, results, varTypes, body) {
@@ -2563,29 +2520,36 @@ function wrapModule(module, self = {}) {
     // segments are assumed to be { passive: bool, offset: expression ref, data: array of 8-bit data }
     return preserveStack(() => {
       const segmentsLen = segments.length;
-      const segmentData = new Array(segmentsLen);
-      const segmentDataLen = new Array(segmentsLen);
-      const segmentPassive = new Array(segmentsLen);
-      const segmentOffset = new Array(segmentsLen);
+      const names = new Array(segmentsLen);
+      const datas = new Array(segmentsLen);
+      const lengths = new Array(segmentsLen);
+      const passives = new Array(segmentsLen);
+      const offsets = new Array(segmentsLen);
       for (let i = 0; i < segmentsLen; i++) {
-        const { data, offset, passive } = segments[i];
-        segmentData[i] = stackAlloc(data.length);
-        HEAP8.set(data, segmentData[i]);
-        segmentDataLen[i] = data.length;
-        segmentPassive[i] = passive;
-        segmentOffset[i] = offset;
+        const { name, data, offset, passive } = segments[i];
+        names[i] = name ? strToStack(name) : null;
+        datas[i] = _malloc(data.length);
+        HEAP8.set(data, datas[i]);
+        lengths[i] = data.length;
+        passives[i] = passive;
+        offsets[i] = offset;
       }
-      return Module['_BinaryenSetMemory'](
+      const ret = Module['_BinaryenSetMemory'](
         module, initial, maximum, strToStack(exportName),
-        i32sToStack(segmentData),
-        i8sToStack(segmentPassive),
-        i32sToStack(segmentOffset),
-        i32sToStack(segmentDataLen),
-        segmentsLen,
-        shared,
-        memory64,
-        strToStack(internalName)
-      );
+          i32sToStack(names),
+          i32sToStack(datas),
+          i8sToStack(passives),
+          i32sToStack(offsets),
+          i32sToStack(lengths),
+          segmentsLen,
+          shared,
+          memory64,
+          strToStack(internalName)
+        );
+      for (let i = 0; i < segmentsLen; i++) {
+        _free(datas[i]);
+      }
+      return ret;
     });
   };
   self['hasMemory'] = function() {
@@ -2607,18 +2571,18 @@ function wrapModule(module, self = {}) {
   self['getNumMemorySegments'] = function() {
     return Module['_BinaryenGetNumMemorySegments'](module);
   };
-  self['getMemorySegmentInfoByIndex'] = function(id) {
-    const passive = Boolean(Module['_BinaryenGetMemorySegmentPassive'](module, id));
+  self['getMemorySegmentInfo'] = function(name) {
+    const passive = Boolean(Module['_BinaryenGetMemorySegmentPassive'](module, strToStack(name)));
     let offset = null;
     if (!passive) {
-      offset = Module['_BinaryenGetMemorySegmentByteOffset'](module, id);
+      offset = Module['_BinaryenGetMemorySegmentByteOffset'](module, strToStack(name));
     }
     return {
       'offset': offset,
       'data': (function(){
-        const size = Module['_BinaryenGetMemorySegmentByteLength'](module, id);
+        const size = Module['_BinaryenGetMemorySegmentByteLength'](module, strToStack(name));
         const ptr = _malloc(size);
-        Module['_BinaryenCopyMemorySegmentData'](module, id, ptr);
+        Module['_BinaryenCopyMemorySegmentData'](module, strToStack(name), ptr);
         const res = new Uint8Array(size);
         res.set(HEAP8.subarray(ptr, ptr + size));
         _free(ptr);
@@ -2629,6 +2593,9 @@ function wrapModule(module, self = {}) {
   };
   self['setStart'] = function(start) {
     return Module['_BinaryenSetStart'](module, start);
+  };
+  self['getStart'] = function() {
+    return Module['_BinaryenGetStart'](module);
   };
   self['getFeatures'] = function() {
     return Module['_BinaryenModuleGetFeatures'](module);
@@ -2680,8 +2647,8 @@ function wrapModule(module, self = {}) {
     if (textPtr) _free(textPtr);
     return text;
   };
-  self['emitStackIR'] = function(optimize) {
-    let textPtr = Module['_BinaryenModuleAllocateAndWriteStackIR'](module, optimize);
+  self['emitStackIR'] = function() {
+    let textPtr = Module['_BinaryenModuleAllocateAndWriteStackIR'](module);
     let text = UTF8ToString(textPtr);
     if (textPtr) _free(textPtr);
     return text;
@@ -2714,9 +2681,6 @@ function wrapModule(module, self = {}) {
     return preserveStack(() =>
       Module['_BinaryenFunctionRunPasses'](func, module, i32sToStack(passes.map(strToStack)), passes.length)
     );
-  };
-  self['autoDrop'] = function() {
-    return Module['_BinaryenModuleAutoDrop'](module);
   };
   self['dispose'] = function() {
     Module['_BinaryenModuleDispose'](module);
@@ -3172,7 +3136,7 @@ Module['getExpressionInfo'] = function(expr) {
     case Module['MemoryInitId']:
       return {
         'id': id,
-        'segment': Module['_BinaryenMemoryInitGetSegment'](expr),
+        'segment': UTF8ToString(Module['_BinaryenMemoryInitGetSegment'](expr)),
         'dest': Module['_BinaryenMemoryInitGetDest'](expr),
         'offset': Module['_BinaryenMemoryInitGetOffset'](expr),
         'size': Module['_BinaryenMemoryInitGetSize'](expr)
@@ -3180,7 +3144,7 @@ Module['getExpressionInfo'] = function(expr) {
     case Module['DataDropId']:
       return {
         'id': id,
-        'segment': Module['_BinaryenDataDropGetSegment'](expr),
+        'segment': UTF8ToString(Module['_BinaryenDataDropGetSegment'](expr)),
       };
     case Module['MemoryCopyId']:
       return {
@@ -3265,11 +3229,11 @@ Module['getExpressionInfo'] = function(expr) {
         'tuple': Module['_BinaryenTupleExtractGetTuple'](expr),
         'index': Module['_BinaryenTupleExtractGetIndex'](expr)
       };
-    case Module['I31NewId']:
+    case Module['RefI31Id']:
       return {
         'id': id,
         'type': type,
-        'value': Module['_BinaryenI31NewGetValue'](expr)
+        'value': Module['_BinaryenRefI31GetValue'](expr)
       };
     case Module['I31GetId']:
       return {
@@ -3314,6 +3278,7 @@ Module['getFunctionInfo'] = function(func) {
     'name': UTF8ToString(Module['_BinaryenFunctionGetName'](func)),
     'module': UTF8ToString(Module['_BinaryenFunctionImportGetModule'](func)),
     'base': UTF8ToString(Module['_BinaryenFunctionImportGetBase'](func)),
+    'type': Module['_BinaryenFunctionGetType'](func),
     'params': Module['_BinaryenFunctionGetParams'](func),
     'results': Module['_BinaryenFunctionGetResults'](func),
     'vars': getAllNested(func, Module['_BinaryenFunctionGetNumVars'], Module['_BinaryenFunctionGetVar']),
@@ -3417,7 +3382,7 @@ Module['readBinary'] = function(data) {
 // Parses text format to a module
 Module['parseText'] = function(text) {
   const buffer = _malloc(text.length + 1);
-  writeAsciiToMemory(text, buffer);
+  stringToAscii(text, buffer);
   const ptr = Module['_BinaryenModuleParse'](buffer);
   _free(buffer);
   return wrapModule(ptr);
@@ -3453,6 +3418,30 @@ Module['setDebugInfo'] = function(on) {
   Module['_BinaryenSetDebugInfo'](on);
 };
 
+// Gets whether no traps can be considered reached at runtime when optimizing.
+Module['getTrapsNeverHappen'] = function() {
+  return Boolean(Module['_BinaryenGetTrapsNeverHappen']());
+};
+
+// Enables or disables whether no traps can be considered reached at
+// runtime when optimizing.
+Module['setTrapsNeverHappen'] = function(on) {
+  Module['_BinaryenSetTrapsNeverHappen'](on);
+};
+
+// Gets whether considering that the code outside of the module does
+// not inspect or interact with GC and function references.
+Module['getClosedWorld'] = function() {
+  return Boolean(Module['_BinaryenGetClosedWorld']());
+};
+
+// Enables or disables whether considering that the code outside of
+// the module does not inspect or interact with GC and function
+// references.
+Module['setClosedWorld'] = function(on) {
+  Module['_BinaryenSetClosedWorld'](on);
+};
+
 // Gets whether the low 1K of memory can be considered unused when optimizing.
 Module['getLowMemoryUnused'] = function() {
   return Boolean(Module['_BinaryenGetLowMemoryUnused']());
@@ -3486,6 +3475,26 @@ Module['setFastMath'] = function(value) {
   Module['_BinaryenSetFastMath'](value);
 };
 
+// Gets whether to generate StackIR during binary writing.
+Module['getGenerateStackIR'] = function() {
+  return Boolean(Module['_BinaryenGetGenerateStackIR']());
+};
+
+// Enable or disable StackIR generation during binary writing.
+Module['setGenerateStackIR'] = function(value) {
+  Module['_BinaryenSetGenerateStackIR'](value);
+};
+
+// Gets whether to optimize StackIR during binary writing.
+Module['getOptimizeStackIR'] = function() {
+  return Boolean(Module['_BinaryenGetOptimizeStackIR']());
+};
+
+// Enable or disable StackIR optimisation during binary writing.
+Module['setOptimizeStackIR'] = function(value) {
+  Module['_BinaryenSetOptimizeStackIR'](value);
+};
+
 // Gets the value of the specified arbitrary pass argument.
 Module['getPassArgument'] = function(key) {
   return preserveStack(() => {
@@ -3503,6 +3512,23 @@ Module['setPassArgument'] = function (key, value) {
 // Clears all arbitrary pass arguments.
 Module['clearPassArguments'] = function() {
   Module['_BinaryenClearPassArguments']();
+};
+
+// Gets whether a pass is in the set of passes to skip.
+Module['hasPassToSkip'] = function(pass) {
+  return preserveStack(() => {
+    return Boolean(Module['_BinaryenHasPassToSkip'](strToStack(pass)));
+  });
+};
+
+// Add a pass to the set of passes to skip.
+Module['addPassToSkip'] = function (pass) {
+  preserveStack(() => { Module['_BinaryenAddPassToSkip'](strToStack(pass)) });
+};
+
+// Clears the set of passes to skip.
+Module['clearPassesToSkip'] = function() {
+  Module['_BinaryenClearPassesToSkip']();
 };
 
 // Gets the function size at which we always inline.
@@ -4543,10 +4569,10 @@ Module['SIMDLoadStoreLane'] = makeExpressionWrapper({
 
 Module['MemoryInit'] = makeExpressionWrapper({
   'getSegment'(expr) {
-    return Module['_BinaryenMemoryInitGetSegment'](expr);
+    return UTF8ToString(Module['_BinaryenMemoryInitGetSegment'](expr));
   },
-  'setSegment'(expr, segmentIndex) {
-    Module['_BinaryenMemoryInitSetSegment'](expr, segmentIndex);
+  'setSegment'(expr, segment) {
+    preserveStack(() => Module['_BinaryenMemoryInitSetSegment'](expr, strToStack(segment)));
   },
   'getDest'(expr) {
     return Module['_BinaryenMemoryInitGetDest'](expr);
@@ -4570,10 +4596,10 @@ Module['MemoryInit'] = makeExpressionWrapper({
 
 Module['DataDrop'] = makeExpressionWrapper({
   'getSegment'(expr) {
-    return Module['_BinaryenDataDropGetSegment'](expr);
+    return UTF8ToString(Module['_BinaryenDataDropGetSegment'](expr));
   },
-  'setSegment'(expr, segmentIndex) {
-    Module['_BinaryenDataDropSetSegment'](expr, segmentIndex);
+  'setSegment'(expr, segment) {
+    preserveStack(() => Module['_BinaryenDataDropSetSegment'](expr, strToStack(segment)));
   }
 });
 
@@ -4831,12 +4857,12 @@ Module['TupleExtract'] = makeExpressionWrapper({
   }
 });
 
-Module['I31New'] = makeExpressionWrapper({
+Module['RefI31'] = makeExpressionWrapper({
   'getValue'(expr) {
-    return Module['_BinaryenI31NewGetValue'](expr);
+    return Module['_BinaryenRefI31GetValue'](expr);
   },
   'setValue'(expr, valueExpr) {
-    Module['_BinaryenI31NewSetValue'](expr, valueExpr);
+    Module['_BinaryenRefI31SetValue'](expr, valueExpr);
   }
 });
 
@@ -4871,6 +4897,9 @@ Module['Function'] = (() => {
   Function['getName'] = function(func) {
     return UTF8ToString(Module['_BinaryenFunctionGetName'](func));
   };
+  Function['getType'] = function(func) {
+    return Module['_BinaryenFunctionGetType'](func);
+  }
   Function['getParams'] = function(func) {
     return Module['_BinaryenFunctionGetParams'](func);
   };

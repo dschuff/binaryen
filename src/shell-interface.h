@@ -125,15 +125,15 @@ struct ShellExternalInterface : ModuleRunner::ExternalInterface {
     ModuleUtils::iterImportedGlobals(wasm, [&](Global* import) {
       auto inst = getImportInstance(import);
       auto* exportedGlobal = inst->wasm.getExportOrNull(import->base);
-      if (!exportedGlobal) {
+      if (!exportedGlobal || exportedGlobal->kind != ExternalKind::Global) {
         Fatal() << "importGlobals: unknown import: " << import->module.str
                 << "." << import->name.str;
       }
-      globals[import->name] = inst->globals[exportedGlobal->value];
+      globals[import->name] = inst->globals[*exportedGlobal->getInternalName()];
     });
   }
 
-  Literals callImport(Function* import, Literals& arguments) override {
+  Literals callImport(Function* import, const Literals& arguments) override {
     if (import->module == SPECTEST && import->base.startsWith(PRINT)) {
       for (auto argument : arguments) {
         std::cout << argument << " : " << argument.type << '\n';
@@ -151,7 +151,7 @@ struct ShellExternalInterface : ModuleRunner::ExternalInterface {
   }
 
   Literals callTable(Name tableName,
-                     Index index,
+                     Address index,
                      HeapType sig,
                      Literals& arguments,
                      Type results,
@@ -191,7 +191,7 @@ struct ShellExternalInterface : ModuleRunner::ExternalInterface {
     if (func->imported()) {
       return callImport(func, arguments);
     } else {
-      return instance.callFunctionInternal(func->name, arguments);
+      return instance.callFunction(func->name, arguments);
     }
   }
 
@@ -287,7 +287,8 @@ struct ShellExternalInterface : ModuleRunner::ExternalInterface {
     return (Index)tables[tableName].size();
   }
 
-  void tableStore(Name tableName, Index index, const Literal& entry) override {
+  void
+  tableStore(Name tableName, Address index, const Literal& entry) override {
     auto& table = tables[tableName];
     if (index >= table.size()) {
       trap("out of bounds table access");
@@ -296,7 +297,7 @@ struct ShellExternalInterface : ModuleRunner::ExternalInterface {
     }
   }
 
-  Literal tableLoad(Name tableName, Index index) override {
+  Literal tableLoad(Name tableName, Address index) override {
     auto it = tables.find(tableName);
     if (it == tables.end()) {
       trap("tableGet on non-existing table");

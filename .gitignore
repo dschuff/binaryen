@@ -19,8 +19,11 @@ CMakeFiles
 /*.ninja
 /.ninja_deps
 /.ninja_log
+/.ninja_log.last_upload
 /bin/
 /lib/
+/_deps/
+/dist/
 /config.h
 /emcc-build
 compile_commands.json

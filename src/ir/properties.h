@@ -59,7 +59,7 @@ inline bool isSymmetric(Binary* binary) {
 
 inline bool isControlFlowStructure(Expression* curr) {
   return curr->is<Block>() || curr->is<If>() || curr->is<Loop>() ||
-         curr->is<Try>();
+         curr->is<Try>() || curr->is<TryTable>();
 }
 
 // Check if an expression is a control flow construct with a name, which implies
@@ -82,10 +82,13 @@ inline bool isNamedControlFlow(Expression* curr) {
 // runtime will be equal as well. TODO: combine this with
 // isValidInConstantExpression or find better names(#4845)
 inline bool isSingleConstantExpression(const Expression* curr) {
+  if (auto* refAs = curr->dynCast<RefAs>()) {
+    if (refAs->op == ExternConvertAny || refAs->op == AnyConvertExtern) {
+      return isSingleConstantExpression(refAs->value);
+    }
+  }
   return curr->is<Const>() || curr->is<RefNull>() || curr->is<RefFunc>() ||
-         curr->is<StringConst>() ||
-         (curr->is<RefAs>() && (curr->cast<RefAs>()->op == ExternExternalize ||
-                                curr->cast<RefAs>()->op == ExternInternalize));
+         curr->is<StringConst>();
 }
 
 inline bool isConstantExpression(const Expression* curr) {
@@ -114,12 +117,19 @@ inline Literal getLiteral(const Expression* curr) {
     return Literal(n->type);
   } else if (auto* r = curr->dynCast<RefFunc>()) {
     return Literal(r->func, r->type.getHeapType());
-  } else if (auto* i = curr->dynCast<I31New>()) {
+  } else if (auto* i = curr->dynCast<RefI31>()) {
     if (auto* c = i->value->dynCast<Const>()) {
-      return Literal::makeI31(c->value.geti32());
+      return Literal::makeI31(c->value.geti32(),
+                              i->type.getHeapType().getShared());
     }
   } else if (auto* s = curr->dynCast<StringConst>()) {
     return Literal(s->string.toString());
+  } else if (auto* r = curr->dynCast<RefAs>()) {
+    if (r->op == ExternConvertAny) {
+      return getLiteral(r->value).externalize();
+    } else if (r->op == AnyConvertExtern) {
+      return getLiteral(r->value).internalize();
+    }
   }
   WASM_UNREACHABLE("non-constant expression");
 }
@@ -320,7 +330,7 @@ inline Expression** getImmediateFallthroughPtr(
     // Extern conversions are not casts and actually produce new values.
     // Treating them as fallthroughs would lead to misoptimizations of
     // subsequent casts.
-    if (as->op != ExternInternalize && as->op != ExternExternalize) {
+    if (as->op != AnyConvertExtern && as->op != ExternConvertAny) {
       return &as->value;
     }
   } else if (auto* br = curr->dynCast<BrOn>()) {
@@ -353,6 +363,74 @@ inline Expression* getFallthrough(
   }
 }
 
+// Look at all the intermediate fallthrough expressions and return the most
+// precise type we know this value will have.
+inline Type getFallthroughType(Expression* curr,
+                               const PassOptions& passOptions,
+                               Module& module) {
+  Type type = curr->type;
+  if (!type.isRef()) {
+    // Only reference types can be improved (excepting improvements to
+    // unreachable, which we leave to refinalization).
+    // TODO: Handle tuples if that ever becomes important.
+    return type;
+  }
+  while (1) {
+    auto* next = getImmediateFallthrough(curr, passOptions, module);
+    if (next == curr) {
+      return type;
+    }
+    type = Type::getGreatestLowerBound(type, next->type);
+    if (type == Type::unreachable) {
+      return type;
+    }
+    curr = next;
+  }
+}
+
+// Find the best fallthrough value ordered by refinement of heaptype, refinement
+// of nullability, and closeness to the current expression. The type of the
+// expression this function returns may be nullable even if `getFallthroughType`
+// is non-nullable, but the heap type will definitely match.
+inline Expression** getMostRefinedFallthrough(Expression** currp,
+                                              const PassOptions& passOptions,
+                                              Module& module) {
+  Expression* curr = *currp;
+  if (!curr->type.isRef()) {
+    return currp;
+  }
+  auto bestType = curr->type.getHeapType();
+  auto bestNullability = curr->type.getNullability();
+  auto** bestp = currp;
+  while (1) {
+    curr = *currp;
+    auto** nextp =
+      Properties::getImmediateFallthroughPtr(currp, passOptions, module);
+    auto* next = *nextp;
+    if (next == curr || next->type == Type::unreachable) {
+      return bestp;
+    }
+    assert(next->type.isRef());
+    auto nextType = next->type.getHeapType();
+    auto nextNullability = next->type.getNullability();
+    if (nextType == bestType) {
+      // Heap types match: refine nullability if possible.
+      if (bestNullability == Nullable && nextNullability == NonNullable) {
+        bestp = nextp;
+        bestNullability = NonNullable;
+      }
+    } else {
+      // Refine heap type if possible, resetting nullability.
+      if (HeapType::isSubType(nextType, bestType)) {
+        bestp = nextp;
+        bestNullability = nextNullability;
+        bestType = nextType;
+      }
+    }
+    currp = nextp;
+  }
+}
+
 inline Index getNumChildren(Expression* curr) {
   Index ret = 0;
 
@@ -370,13 +448,10 @@ inline Index getNumChildren(Expression* curr) {
   }
 
 #define DELEGATE_FIELD_INT(id, field)
-#define DELEGATE_FIELD_INT_ARRAY(id, field)
 #define DELEGATE_FIELD_LITERAL(id, field)
 #define DELEGATE_FIELD_NAME(id, field)
-#define DELEGATE_FIELD_NAME_VECTOR(id, field)
 #define DELEGATE_FIELD_SCOPE_NAME_DEF(id, field)
 #define DELEGATE_FIELD_SCOPE_NAME_USE(id, field)
-#define DELEGATE_FIELD_SCOPE_NAME_USE_VECTOR(id, field)
 #define DELEGATE_FIELD_TYPE(id, field)
 #define DELEGATE_FIELD_HEAPTYPE(id, field)
 #define DELEGATE_FIELD_ADDRESS(id, field)
@@ -401,14 +476,38 @@ inline bool isResultFallthrough(Expression* curr) {
   // unreachable, for example, but then there is no meaningful answer to give
   // anyhow.
   return curr->is<LocalSet>() || curr->is<Block>() || curr->is<If>() ||
-         curr->is<Loop>() || curr->is<Try>() || curr->is<Select>() ||
-         curr->is<Break>();
+         curr->is<Loop>() || curr->is<Try>() || curr->is<TryTable>() ||
+         curr->is<Select>() || curr->is<Break>();
 }
 
 inline bool canEmitSelectWithArms(Expression* ifTrue, Expression* ifFalse) {
   // A select only allows a single value in its arms in the spec:
   // https://webassembly.github.io/spec/core/valid/instructions.html#xref-syntax-instructions-syntax-instr-parametric-mathsf-select-t-ast
   return ifTrue->type.isSingle() && ifFalse->type.isSingle();
+}
+
+// If this instruction accesses memory or the heap, or otherwise participates in
+// shared memory synchronization, return the memory order corresponding to the
+// kind of synchronization it does. Return MemoryOrder::Unordered if there is no
+// synchronization. Does not look at children.
+inline MemoryOrder getMemoryOrder(Expression* curr) {
+  if (auto* get = curr->dynCast<StructGet>()) {
+    return get->order;
+  }
+  if (auto* set = curr->dynCast<StructSet>()) {
+    return set->order;
+  }
+  if (auto* load = curr->dynCast<Load>()) {
+    return load->isAtomic ? MemoryOrder::SeqCst : MemoryOrder::Unordered;
+  }
+  if (auto* store = curr->dynCast<Store>()) {
+    return store->isAtomic ? MemoryOrder::SeqCst : MemoryOrder::Unordered;
+  }
+  if (curr->is<AtomicRMW>() || curr->is<AtomicWait>() ||
+      curr->is<AtomicNotify>() || curr->is<AtomicFence>()) {
+    return MemoryOrder::SeqCst;
+  }
+  return MemoryOrder::Unordered;
 }
 
 // A "generative" expression is one that can generate different results for the
@@ -453,7 +552,10 @@ inline bool canEmitSelectWithArms(Expression* ifTrue, Expression* ifFalse) {
 //    the latter because calls are already handled best in other manners (using
 //    EffectAnalyzer).
 //
-bool isGenerative(Expression* curr, FeatureSet features);
+bool isGenerative(Expression* curr);
+
+// As above, but only checks |curr| and not children.
+bool isShallowlyGenerative(Expression* curr);
 
 // Whether this expression is valid in a context where WebAssembly requires a
 // constant expression, such as a global initializer.

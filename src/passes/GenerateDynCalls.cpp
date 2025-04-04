@@ -110,14 +110,21 @@ static void exportFunction(Module& wasm, Name name, bool must_export) {
   if (wasm.getExportOrNull(name)) {
     return; // Already exported
   }
-  auto exp = new Export;
-  exp->name = exp->value = name;
-  exp->kind = ExternalKind::Function;
-  wasm.addExport(exp);
+  wasm.addExport(new Export(name, ExternalKind::Function, name));
 }
 
 void GenerateDynCalls::generateDynCallThunk(HeapType funcType) {
   Signature sig = funcType.getSignature();
+
+  if (sig.results.isTuple()) {
+    // Emscripten output is assumed to be MVP, and not to have multiple return
+    // values. In particular, signatures in Emscripten all look like "abcd"
+    // where "a" is the single return value, and "bcd" are the (in this case
+    // three) parameters.
+    Fatal() << "GenerateDynCalls: Cannot operate on multiple return values:"
+            << sig.results;
+  }
+
   if (onlyI64 && !hasI64(sig)) {
     return;
   }
@@ -130,8 +137,18 @@ void GenerateDynCalls::generateDynCallThunk(HeapType funcType) {
   }
   std::vector<NameType> namedParams;
   std::vector<Type> params;
-  namedParams.emplace_back("fptr", Type::i32); // function pointer param
-  params.push_back(Type::i32);
+  if (wasm->tables.empty()) {
+    // Add an imported table in exactly the same manner as the LLVM wasm backend
+    // would add one.
+    auto* table = wasm->addTable(Builder::makeTable(Name::fromInt(0)));
+    table->module = ENV;
+    table->base = "__indirect_function_table";
+    table->addressType = wasm->memories[0]->addressType;
+  }
+  auto& table = wasm->tables[0];
+  namedParams.emplace_back("fptr",
+                           table->addressType); // function pointer param
+  params.push_back(table->addressType);
   int p = 0;
   for (const auto& param : sig.params) {
     namedParams.emplace_back(std::to_string(p++), param);
@@ -139,21 +156,14 @@ void GenerateDynCalls::generateDynCallThunk(HeapType funcType) {
   }
   auto f = builder.makeFunction(
     name, std::move(namedParams), Signature(Type(params), sig.results), {});
-  Expression* fptr = builder.makeLocalGet(0, Type::i32);
+  f->hasExplicitName = true;
+  Expression* fptr = builder.makeLocalGet(0, table->addressType);
   std::vector<Expression*> args;
   Index i = 0;
   for (const auto& param : sig.params) {
     args.push_back(builder.makeLocalGet(++i, param));
   }
-  if (wasm->tables.empty()) {
-    // Add an imported table in exactly the same manner as the LLVM wasm backend
-    // would add one.
-    auto* table = wasm->addTable(Builder::makeTable(Name::fromInt(0)));
-    table->module = ENV;
-    table->base = "__indirect_function_table";
-  }
-  f->body =
-    builder.makeCallIndirect(wasm->tables[0]->name, fptr, args, funcType);
+  f->body = builder.makeCallIndirect(table->name, fptr, args, funcType);
 
   wasm->addFunction(std::move(f));
   exportFunction(*wasm, name, true);

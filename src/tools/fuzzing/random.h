@@ -35,7 +35,7 @@ class Random {
   bool finishedInput = false;
   // After we finish the input, we start going through it again, but xoring
   // so it's not identical.
-  int xorFactor = 0;
+  unsigned int xorFactor = 0;
   // Features used for picking among FeatureOptions.
   FeatureSet features;
 
@@ -62,6 +62,16 @@ public:
   uint32_t upToSquared(uint32_t x) { return upTo(upTo(x)); }
 
   bool finished() { return finishedInput; }
+
+  // How many bytes of data remain to be used.
+  size_t remaining() {
+    if (finishedInput) {
+      // We finished it and are cycling through it again (using xorFactor to try
+      // to improve the entropy).
+      return 0;
+    }
+    return bytes.size() - pos;
+  }
 
   // Pick from a vector-like container
   template<typename T> const typename T::value_type& pick(const T& vec) {

@@ -19,16 +19,8 @@
 // This is helpful for fuzzing.
 //
 
-/*
-high chance for set at start of loop
-  high chance of get of a set local in the scope of that scope
-    high chance of a tee in that case => loop var
-*/
-
-// TODO Generate exception handling instructions
-
 #include "ir/branch-utils.h"
-#include "ir/memory-utils.h"
+#include "ir/struct-utils.h"
 #include "support/insert_ordered.h"
 #include "tools/fuzzing/random.h"
 #include <ir/eh-utils.h>
@@ -63,22 +55,90 @@ struct BinaryArgs {
   Expression* c;
 };
 
+// params
+
+struct FuzzParams {
+  // The maximum amount of params to each function.
+  int MAX_PARAMS;
+
+  // The maximum amount of vars in each function.
+  int MAX_VARS;
+
+  // The maximum number of globals in a module.
+  int MAX_GLOBALS;
+
+  // The maximum number of tuple elements.
+  int MAX_TUPLE_SIZE;
+
+  // The maximum number of struct fields.
+  int MAX_STRUCT_SIZE;
+
+  // The maximum number of elements in an array.
+  int MAX_ARRAY_SIZE;
+
+  // The number of nontrivial heap types to generate.
+  int MIN_HEAPTYPES;
+  int MAX_HEAPTYPES;
+
+  // some things require luck, try them a few times
+  int TRIES;
+
+  // beyond a nesting limit, greatly decrease the chance to continue to nest
+  int NESTING_LIMIT;
+
+  // the maximum size of a block
+  int BLOCK_FACTOR;
+
+  // the memory that we use, a small portion so that we have a good chance of
+  // looking at writes (we also look outside of this region with small
+  // probability) this should be a power of 2
+  Address USABLE_MEMORY;
+
+  // the number of runtime iterations (function calls, loop backbranches) we
+  // allow before we stop execution with a trap, to prevent hangs. 0 means
+  // no hang protection.
+  int HANG_LIMIT;
+
+  // the maximum amount of new GC types (structs, etc.) to create
+  int MAX_NEW_GC_TYPES;
+
+  // the maximum amount of catches in each try (not including a catch-all, if
+  // present).
+  int MAX_TRY_CATCHES;
+
+  FuzzParams() { setDefaults(); }
+
+  void setDefaults();
+};
+
 // main reader
 
 class TranslateToFuzzReader {
+  static constexpr size_t VeryImportant = 4;
+  static constexpr size_t Important = 2;
+
 public:
-  TranslateToFuzzReader(Module& wasm, std::vector<char>&& input);
-  TranslateToFuzzReader(Module& wasm, std::string& filename);
+  TranslateToFuzzReader(Module& wasm,
+                        std::vector<char>&& input,
+                        bool closedWorld = false);
+  TranslateToFuzzReader(Module& wasm,
+                        std::string& filename,
+                        bool closedWorld = false);
 
   void pickPasses(OptimizationOptions& options);
   void setAllowMemory(bool allowMemory_) { allowMemory = allowMemory_; }
   void setAllowOOB(bool allowOOB_) { allowOOB = allowOOB_; }
+  void setPreserveImportsAndExports(bool preserveImportsAndExports_) {
+    preserveImportsAndExports = preserveImportsAndExports_;
+  }
 
   void build();
 
   Module& wasm;
 
 private:
+  // Whether the module will be tested in a closed-world environment.
+  bool closedWorld;
   Builder builder;
   Random random;
 
@@ -88,6 +148,13 @@ private:
   // Whether to emit loads, stores, and call_indirects that may be out
   // of bounds (which traps in wasm, and is undefined behavior in C).
   bool allowOOB = true;
+
+  // Whether we preserve imports and exports. Normally we add imports (for
+  // logging and other useful functionality for testing), and add exports of
+  // functions as we create them. With this set, we add neither imports nor
+  // exports, which is useful if the tool using us only wants us to mutate an
+  // existing testcase (using initial-content).
+  bool preserveImportsAndExports = false;
 
   // Whether we allow the fuzzer to add unreachable code when generating changes
   // to existing code. This is randomized during startup, but could be an option
@@ -104,20 +171,49 @@ private:
   Name HANG_LIMIT_GLOBAL;
 
   Name funcrefTableName;
+  Name exnrefTableName;
+
+  std::unordered_map<Type, Name> logImportNames;
+  Name throwImportName;
+  Name tableGetImportName;
+  Name tableSetImportName;
+  Name callExportImportName;
+  Name callExportCatchImportName;
+  Name callRefImportName;
+  Name callRefCatchImportName;
+  Name sleepImportName;
 
   std::unordered_map<Type, std::vector<Name>> globalsByType;
   std::unordered_map<Type, std::vector<Name>> mutableGlobalsByType;
+  std::unordered_map<Type, std::vector<Name>> immutableGlobalsByType;
+  std::unordered_map<Type, std::vector<Name>> importedImmutableGlobalsByType;
 
   std::vector<Type> loggableTypes;
 
   // The heap types we can pick from to generate instructions.
-  std::vector<HeapType> interestingHeapTypes;
+  std::vector<HeapTypeDef> interestingHeapTypes;
 
   // A mapping of a heap type to the subset of interestingHeapTypes that are
   // subtypes of it.
-  std::unordered_map<HeapType, std::vector<HeapType>> interestingHeapSubTypes;
+  std::unordered_map<HeapTypeDef, std::vector<HeapTypeDef>>
+    interestingHeapSubTypes;
+
+  // Type => list of struct fields that have that type.
+  std::unordered_map<Type, std::vector<StructField>> typeStructFields;
+
+  // Type => list of array types that have that type.
+  std::unordered_map<Type, std::vector<HeapType>> typeArrays;
+
+  // All struct fields that are mutable.
+  std::vector<StructField> mutableStructFields;
+
+  // All arrays that are mutable.
+  std::vector<HeapType> mutableArrays;
 
   Index numAddedFunctions = 0;
+
+  // The name of an empty tag.
+  Name trivialTag;
 
   // RAII helper for managing the state used to create a single function.
   struct FunctionCreationContext {
@@ -133,26 +229,59 @@ private:
     // type => list of locals with that type
     std::unordered_map<Type, std::vector<Index>> typeLocals;
 
-    FunctionCreationContext(TranslateToFuzzReader& parent, Function* func)
-      : parent(parent), func(func) {
-      parent.funcContext = this;
-    }
+    FunctionCreationContext(TranslateToFuzzReader& parent, Function* func);
 
     ~FunctionCreationContext();
+
+    // Fill in the typeLocals data structure.
+    void computeTypeLocals() {
+      typeLocals.clear();
+      for (Index i = 0; i < func->getNumLocals(); i++) {
+        typeLocals[func->getLocalType(i)].push_back(i);
+      }
+    }
   };
 
   FunctionCreationContext* funcContext = nullptr;
+
+  // The fuzzing parameters we use. This may change from function to function or
+  // even in a more refined manner, so we use an RAII context to manage it.
+  struct FuzzParamsContext : public FuzzParams {
+    TranslateToFuzzReader& parent;
+
+    FuzzParamsContext* old;
+
+    FuzzParamsContext(TranslateToFuzzReader& parent)
+      : parent(parent), old(parent.fuzzParams) {
+      parent.fuzzParams = this;
+    }
+
+    ~FuzzParamsContext() { parent.fuzzParams = old; }
+  };
+
+  FuzzParamsContext* fuzzParams = nullptr;
+
+  // The default global context we use throughout the process (unless it is
+  // overridden using another context in an RAII manner).
+  std::unique_ptr<FuzzParamsContext> globalParams;
 
 public:
   int nesting = 0;
 
   struct AutoNester {
     TranslateToFuzzReader& parent;
+    size_t amount = 1;
 
     AutoNester(TranslateToFuzzReader& parent) : parent(parent) {
       parent.nesting++;
     }
-    ~AutoNester() { parent.nesting--; }
+    ~AutoNester() { parent.nesting -= amount; }
+
+    // Add more nesting manually.
+    void add(size_t more) {
+      parent.nesting += more;
+      amount += more;
+    }
   };
 
 private:
@@ -187,20 +316,39 @@ private:
   void setupTables();
   void setupGlobals();
   void setupTags();
+  void addTag();
   void finalizeMemory();
   void finalizeTable();
+  void shuffleExports();
   void prepareHangLimitSupport();
   void addHangLimitSupport();
   void addImportLoggingSupport();
+  void addImportCallingSupport();
+  void addImportThrowingSupport();
+  void addImportTableSupport();
+  void addImportSleepSupport();
   void addHashMemorySupport();
 
   // Special expression makers
   Expression* makeHangLimitCheck();
-  Expression* makeLogging();
+  Expression* makeImportLogging();
+  Expression* makeImportThrowing(Type type);
+  Expression* makeImportTableGet();
+  Expression* makeImportTableSet(Type type);
+  // Call either an export or a ref. We do this from a single function to better
+  // control the frequency of each.
+  Expression* makeImportCallCode(Type type);
+  Expression* makeImportSleep(Type type);
   Expression* makeMemoryHashLogging();
 
-  // Function creation
+  // Function operations. The main processFunctions() loop will call addFunction
+  // as well as modFunction().
+  void processFunctions();
+  // Add a new function.
   Function* addFunction();
+  // Modify an existing function.
+  void modFunction(Function* func);
+
   void addHangLimitChecks(Function* func);
 
   // Recombination and mutation
@@ -251,6 +399,10 @@ private:
   // Make something with no chance of infinite recursion.
   Expression* makeTrivial(Type type);
 
+  // We must note when we are nested in a makeTrivial() call. When we are, all
+  // operations must try to be as trivial as possible.
+  int trivialNesting = 0;
+
   // Specific expression creators
   Expression* makeBlock(Type type);
   Expression* makeLoop(Type type);
@@ -259,16 +411,14 @@ private:
   Expression* makeMaybeBlock(Type type);
   Expression* buildIf(const struct ThreeArgs& args, Type type);
   Expression* makeIf(Type type);
+  Expression* makeTry(Type type);
+  Expression* makeTryTable(Type type);
   Expression* makeBreak(Type type);
   Expression* makeCall(Type type);
   Expression* makeCallIndirect(Type type);
   Expression* makeCallRef(Type type);
   Expression* makeLocalGet(Type type);
   Expression* makeLocalSet(Type type);
-  // Some globals are for internal use, and should not be modified by random
-  // fuzz code.
-  bool isValidGlobal(Name name);
-
   Expression* makeGlobalGet(Type type);
   Expression* makeGlobalSet(Type type);
   Expression* makeTupleMake(Type type);
@@ -278,6 +428,7 @@ private:
   Expression* makeLoad(Type type);
   Expression* makeNonAtomicStore(Type type);
   Expression* makeStore(Type type);
+
   // Makes a small change to a constant value.
   Literal tweak(Literal value);
   Literal makeLiteral(Type type);
@@ -289,16 +440,31 @@ private:
   // we may add a GC cast to fixup the type.
   Expression* makeConst(Type type);
 
-  // Like makeConst, but for a type that is a reference type. One function
-  // handles basic types, and the other compound ones.
-  Expression* makeConstBasicRef(Type type);
-  Expression* makeConstCompoundRef(Type type);
+  // Generate reference values. One function handles basic types, and the other
+  // compound ones.
+  Expression* makeBasicRef(Type type);
+  Expression* makeCompoundRef(Type type);
+
+  Expression* makeStringConst();
+  Expression* makeStringNewArray();
+  Expression* makeStringNewCodePoint();
+  Expression* makeStringConcat();
+  Expression* makeStringSlice();
+  Expression* makeStringEq(Type type);
+  Expression* makeStringMeasure(Type type);
+  Expression* makeStringGet(Type type);
+  Expression* makeStringEncode(Type type);
+
+  // Similar to makeBasic/CompoundRef, but indicates that this value will be
+  // used in a place that will trap on null. For example, the reference of a
+  // struct.get or array.set would use this.
+  Expression* makeTrappingRefUse(HeapType type);
 
   Expression* buildUnary(const UnaryArgs& args);
   Expression* makeUnary(Type type);
   Expression* buildBinary(const BinaryArgs& args);
   Expression* makeBinary(Type type);
-  Expression* buildSelect(const ThreeArgs& args, Type type);
+  Expression* buildSelect(const ThreeArgs& args);
   Expression* makeSelect(Type type);
   Expression* makeSwitch(Type type);
   Expression* makeDrop(Type type);
@@ -314,12 +480,31 @@ private:
   Expression* makeSIMDShift();
   Expression* makeSIMDLoad();
   Expression* makeBulkMemory(Type type);
+  Expression* makeTableGet(Type type);
+  Expression* makeTableSet(Type type);
   // TODO: support other RefIs variants, and rename this
   Expression* makeRefIsNull(Type type);
   Expression* makeRefEq(Type type);
   Expression* makeRefTest(Type type);
-  Expression* makeI31New(Type type);
+  Expression* makeRefCast(Type type);
+  Expression* makeBrOn(Type type);
+
+  // Decide to emit a signed Struct/ArrayGet sometimes, when the field is
+  // packed.
+  bool maybeSignedGet(const Field& field);
+
+  Expression* makeStructGet(Type type);
+  Expression* makeStructSet(Type type);
+  Expression* makeArrayGet(Type type);
+  Expression* makeArraySet(Type type);
+  // Use a single method for the misc array operations, to not give them too
+  // much representation (e.g. compared to struct operations, which only include
+  // get/set).
+  Expression* makeArrayBulkMemoryOp(Type type);
   Expression* makeI31Get(Type type);
+  Expression* makeThrow(Type type);
+  Expression* makeThrowRef(Type type);
+
   Expression* makeMemoryInit();
   Expression* makeDataDrop();
   Expression* makeMemoryCopy();
@@ -340,6 +525,10 @@ private:
   Nullability getSubType(Nullability nullability);
   HeapType getSubType(HeapType type);
   Type getSubType(Type type);
+  Nullability getSuperType(Nullability nullability);
+  HeapType getSuperType(HeapType type);
+  Type getSuperType(Type type);
+  HeapType getArrayTypeForString();
 
   // Utilities
   Name getTargetName(Expression* target);
@@ -354,8 +543,3 @@ private:
 };
 
 } // namespace wasm
-
-// XXX Switch class has a condition?! is it real? should the node type be the
-// value type if it exists?!
-
-// TODO copy an existing function and replace just one node in it

@@ -39,6 +39,9 @@ namespace wasm {
 static Name makeHighName(Name n) { return n.toString() + "$hi"; }
 
 struct I64ToI32Lowering : public WalkerPass<PostWalker<I64ToI32Lowering>> {
+  // Adds calls to helper functions.
+  bool addsEffects() override { return true; }
+
   struct TempVar {
     TempVar(Index idx, Type ty, I64ToI32Lowering& pass)
       : idx(idx), pass(pass), moved(false), ty(ty) {}
@@ -105,7 +108,7 @@ struct I64ToI32Lowering : public WalkerPass<PostWalker<I64ToI32Lowering>> {
 
   void doWalkModule(Module* module) {
     if (!builder) {
-      builder = make_unique<Builder>(*module);
+      builder = std::make_unique<Builder>(*module);
     }
     // add new globals for high bits
     for (size_t i = 0, globals = module->globals.size(); i < globals; ++i) {
@@ -154,7 +157,7 @@ struct I64ToI32Lowering : public WalkerPass<PostWalker<I64ToI32Lowering>> {
     Flat::verifyFlatness(func);
     // create builder here if this is first entry to module for this object
     if (!builder) {
-      builder = make_unique<Builder>(*getModule());
+      builder = std::make_unique<Builder>(*getModule());
     }
     indexMap.clear();
     highBitVars.clear();
@@ -292,6 +295,41 @@ struct I64ToI32Lowering : public WalkerPass<PostWalker<I64ToI32Lowering>> {
                                          Signature(Type(params), results),
                                          curr->isReturn);
       });
+  }
+
+  void visitRefFunc(RefFunc* curr) {
+    auto sig = curr->type.getHeapType().getSignature();
+
+    bool hasI64Param = false;
+    for (auto t : sig.params) {
+      if (t == Type::i64) {
+        hasI64Param = true;
+        break;
+      }
+    }
+    auto params = sig.params;
+    if (hasI64Param) {
+      std::vector<Type> newParams;
+      for (auto t : sig.params) {
+        if (t == Type::i64) {
+          newParams.push_back(Type::i32);
+          newParams.push_back(Type::i32);
+        } else {
+          newParams.push_back(t);
+        }
+      }
+      params = Type(newParams);
+    };
+    auto results = sig.results;
+    // Update the results the same way we do when visiting functions. We use a
+    // global rather than multivalue to lower i64 results.
+    if (results == Type::i64) {
+      results = Type::i32;
+    }
+
+    if (params != sig.params || results != sig.results) {
+      curr->type = curr->type.with(HeapType(Signature(params, results)));
+    }
   }
 
   void visitLocalGet(LocalGet* curr) {

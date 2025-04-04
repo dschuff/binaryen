@@ -32,7 +32,9 @@ struct NameTypes : public Pass {
 
   void run(Module* module) override {
     // Find all the types.
-    std::vector<HeapType> types = ModuleUtils::collectHeapTypes(*module);
+    std::vector<HeapTypeDef> types = ModuleUtils::collectHeapTypes(*module);
+
+    std::unordered_set<Name> used;
 
     // Ensure simple names. If a name already exists, and is short enough, keep
     // it.
@@ -40,7 +42,28 @@ struct NameTypes : public Pass {
     for (auto& type : types) {
       if (module->typeNames.count(type) == 0 ||
           module->typeNames[type].name.size() >= NameLenLimit) {
-        module->typeNames[type].name = "type$" + std::to_string(i++);
+        module->typeNames[type].name = "type_" + std::to_string(i++);
+      }
+      used.insert(module->typeNames[type].name);
+    }
+
+    // "Lint" the names a little. In particular a name with a "_7" or such
+    // suffix, as TypeSSA creates, can be removed if it does not cause a
+    // collision. This keeps the names unique while removing 'noise.'
+    //
+    // Note we must iterate in a deterministic order here, so do it on |types|.
+    for (auto& type : types) {
+      auto& names = module->typeNames[type];
+      std::string name = names.name.toString();
+      while (name.size() > 1 && isdigit(name.back())) {
+        name.pop_back();
+      }
+      if (name.size() > 1 && name.back() == '_') {
+        name.pop_back();
+        if (!used.count(name)) {
+          names.name = name;
+          used.insert(name);
+        }
       }
     }
   }

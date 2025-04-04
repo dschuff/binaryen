@@ -17,10 +17,15 @@
 #ifndef wasm_ir_struct_utils_h
 #define wasm_ir_struct_utils_h
 
+#include "ir/properties.h"
 #include "ir/subtypes.h"
 #include "wasm.h"
 
 namespace wasm {
+
+// A pair of a struct type and a field index, together defining a field in a
+// particular type.
+using StructField = std::pair<HeapType, Index>;
 
 namespace StructUtils {
 
@@ -113,8 +118,14 @@ struct FunctionStructValuesMap
 //
 //   void noteDefault(Type fieldType, HeapType type, Index index, T& info);
 //
+// * Note a RMW operation on a field. TODO: Pass more useful information here.
+//
+//   void noteRMW(Expression* expr, HeapType type, Index index, T& info);
+//
 // * Note a copied value (read from this field and written to the same, possibly
-//   in another object).
+//   in another object). Note that we require that the two types (the one read
+//   from, and written to) are identical; allowing subtyping is possible, but
+//   would add complexity amid diminishing returns.
 //
 //   void noteCopy(HeapType type, Index index, T& info);
 //
@@ -133,6 +144,8 @@ struct StructScanner
 
   bool modifiesBinaryenIR() override { return false; }
 
+  SubType& self() { return *static_cast<SubType*>(this); }
+
   StructScanner(FunctionStructValuesMap<T>& functionNewInfos,
                 FunctionStructValuesMap<T>& functionSetGetInfos)
     : functionNewInfos(functionNewInfos),
@@ -150,8 +163,7 @@ struct StructScanner
     auto& infos = functionNewInfos[this->getFunction()][heapType];
     for (Index i = 0; i < fields.size(); i++) {
       if (curr->isWithDefault()) {
-        static_cast<SubType*>(this)->noteDefault(
-          fields[i].type, heapType, i, infos[i]);
+        self().noteDefault(fields[i].type, heapType, i, infos[i]);
       } else {
         noteExpressionOrCopy(curr->operands[i], heapType, i, infos[i]);
       }
@@ -180,10 +192,48 @@ struct StructScanner
 
     auto heapType = type.getHeapType();
     auto index = curr->index;
-    static_cast<SubType*>(this)->noteRead(
-      heapType,
-      index,
-      functionSetGetInfos[this->getFunction()][heapType][index]);
+    self().noteRead(heapType,
+                    index,
+                    functionSetGetInfos[this->getFunction()][heapType][index]);
+  }
+
+  void visitStructRMW(StructRMW* curr) {
+    auto type = curr->ref->type;
+    if (type == Type::unreachable || type.isNull()) {
+      return;
+    }
+
+    auto heapType = type.getHeapType();
+    auto index = curr->index;
+    auto& info =
+      functionSetGetInfos[this->getFunction()][type.getHeapType()][index];
+
+    if (curr->op == RMWXchg) {
+      // An xchg is really like a read and write combined.
+      self().noteRead(heapType, index, info);
+      noteExpressionOrCopy(curr->value, heapType, index, info);
+      return;
+    }
+
+    // Otherwise we don't have a simple expression to describe the written
+    // value, so fall back to noting an opaque RMW.
+    self().noteRMW(curr->value, heapType, index, info);
+  }
+
+  void visitStructCmpxchg(StructCmpxchg* curr) {
+    auto type = curr->ref->type;
+    if (type == Type::unreachable || type.isNull()) {
+      return;
+    }
+
+    auto heapType = type.getHeapType();
+    auto index = curr->index;
+    auto& info =
+      functionSetGetInfos[this->getFunction()][type.getHeapType()][curr->index];
+
+    // A cmpxchg is like a read and conditional write.
+    self().noteRead(heapType, index, info);
+    noteExpressionOrCopy(curr->replacement, heapType, index, info);
   }
 
   void
@@ -227,7 +277,12 @@ struct StructScanner
 // if we changed something.
 template<typename T> class TypeHierarchyPropagator {
 public:
+  // Constructor that gets a module and computes subtypes.
   TypeHierarchyPropagator(Module& wasm) : subTypes(wasm) {}
+
+  // Constructor that gets subtypes and uses them, avoiding a scan of a
+  // module. TODO: avoid a copy here?
+  TypeHierarchyPropagator(const SubTypes& subTypes) : subTypes(subTypes) {}
 
   SubTypes subTypes;
 
@@ -257,7 +312,7 @@ private:
 
       if (toSuperTypes) {
         // Propagate shared fields to the supertype.
-        if (auto superType = type.getSuperType()) {
+        if (auto superType = type.getDeclaredSuperType()) {
           auto& superInfos = combinedInfos[*superType];
           auto& superFields = superType->getStruct().fields;
           for (Index i = 0; i < superFields.size(); i++) {
@@ -271,7 +326,7 @@ private:
       if (toSubTypes) {
         // Propagate shared fields to the subtypes.
         auto numFields = type.getStruct().fields.size();
-        for (auto subType : subTypes.getStrictSubTypes(type)) {
+        for (auto subType : subTypes.getImmediateSubTypes(type)) {
           auto& subInfos = combinedInfos[subType];
           for (Index i = 0; i < numFields; i++) {
             if (subInfos[i].combine(infos[i])) {

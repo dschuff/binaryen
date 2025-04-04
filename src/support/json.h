@@ -39,6 +39,7 @@
 
 #include "support/istring.h"
 #include "support/safe_integer.h"
+#include "support/string.h"
 
 namespace json {
 
@@ -53,6 +54,8 @@ struct Value {
     Ref& operator[](size_t x) { return (*this->get())[x]; }
     Ref& operator[](IString x) { return (*this->get())[x]; }
   };
+
+  template<typename T> static Ref make(T t) { return Ref(new Value(t)); }
 
   enum Type {
     String = 0,
@@ -246,7 +249,16 @@ struct Value {
     return true;
   }
 
-  char* parse(char* curr) {
+  // The encoding into which we parse strings. The input encoding is always
+  // UTF8, but we can parse into ASCII (very quickly, and without many small
+  // allocations), or we can parse into WTF16 (which is the format used by
+  // StringConst).
+  enum StringEncoding {
+    ASCII,
+    WTF16,
+  };
+
+  char* parse(char* curr, StringEncoding stringEncoding) {
 #define is_json_space(x)                                                       \
   (x == 32 || x == 9 || x == 10 ||                                             \
    x == 13) /* space, tab, linefeed/newline, or return */
@@ -258,11 +270,23 @@ struct Value {
     skip();
     if (*curr == '"') {
       // String
-      curr++;
-      char* close = strchr(curr, '"');
+      // Start |close| at the opening ", and in the loop below we will always
+      // begin looking at the first character after.
+      char* close = curr;
+      // Skip escaped "
+      do {
+        close = strchr(close + 1, '"');
+      } while (*(close - 1) == '\\');
       assert(close);
       *close = 0; // end this string, and reuse it straight from the input
-      setString(curr);
+      char* raw = curr + 1;
+      if (stringEncoding == ASCII) {
+        // Just use the current string.
+        setString(raw);
+      } else {
+        assert(stringEncoding == WTF16);
+        unescapeIntoWTF16(raw);
+      }
       curr = close + 1;
     } else if (*curr == '[') {
       // Array
@@ -272,7 +296,7 @@ struct Value {
       while (*curr != ']') {
         Ref temp = Ref(new Value());
         arr->push_back(temp);
-        curr = temp->parse(curr);
+        curr = temp->parse(curr, stringEncoding);
         skip();
         if (*curr == ']') {
           break;
@@ -315,7 +339,7 @@ struct Value {
         curr++;
         skip();
         Ref value = Ref(new Value());
-        curr = value->parse(curr);
+        curr = value->parse(curr, stringEncoding);
         (*obj)[key] = value;
         skip();
         if (*curr == '}') {
@@ -400,6 +424,17 @@ struct Value {
   bool has(IString x) {
     assert(isObject());
     return obj->count(x) > 0;
+  }
+
+private:
+  // Unescape the input (UTF8) string into one of our internal strings (WTF16).
+  void unescapeIntoWTF16(char* str) {
+    // TODO: Optimize the unescaped path? But it is impossible to avoid an
+    //       allocation here.
+    std::stringstream ss;
+    wasm::String::unescapeUTF8JSONtoWTF16(ss, str);
+    // TODO: Use ss.view() once we have C++20.
+    setString(ss.str());
   }
 };
 

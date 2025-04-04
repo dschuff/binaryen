@@ -31,6 +31,7 @@
 #include "ir/iteration.h"
 #include "ir/literal-utils.h"
 #include "ir/properties.h"
+#include "ir/utils.h"
 #include "pass.h"
 #include "support/colors.h"
 #include "support/command-line.h"
@@ -42,6 +43,7 @@
 #include "wasm-builder.h"
 #include "wasm-io.h"
 #include "wasm-validator.h"
+
 #ifdef _WIN32
 #ifndef NOMINMAX
 #define NOMINMAX
@@ -71,6 +73,7 @@ std::string GetLastErrorStdStr() {
   return std::string();
 }
 #endif
+
 using namespace wasm;
 
 // A timeout on every execution of the command.
@@ -79,6 +82,9 @@ static size_t timeout = 2;
 // A string of feature flags and other things to pass while reducing. The
 // default of enabling all features should work in most cases.
 static std::string extraFlags = "-all";
+
+// Whether to save all intermediate working files as we go.
+static bool saveAllWorkingFiles = false;
 
 struct ProgramResult {
   int code;
@@ -228,6 +234,11 @@ ProgramResult expected;
 // case we may try again but much later.
 static std::unordered_set<Name> functionsWeTriedToRemove;
 
+// The index of the working file we save, when saveAllWorkingFiles. We must
+// store this globally so that the difference instances of Reducer do not
+// overlap.
+static size_t workingFileIndex = 0;
+
 struct Reducer
   : public WalkerPass<PostWalker<Reducer, UnifiedExpressionVisitor<Reducer>>> {
   std::string command, test, working;
@@ -253,20 +264,26 @@ struct Reducer
   void reduceUsingPasses() {
     // run optimization passes until we can't shrink it any more
     std::vector<std::string> passes = {
+      // Optimization modes.
       "-Oz",
       "-Os",
       "-O1",
       "-O2",
       "-O3",
       "-O4",
+      // Optimization modes + passes that work well with them.
       "--flatten -Os",
       "--flatten -O3",
       "--flatten --simplify-locals-notee-nostructure --local-cse -Os",
+      "--type-ssa -Os --type-merging",
+      "--gufa -O1",
+      // Individual passes or combinations of them.
       "--coalesce-locals --vacuum",
       "--dae",
       "--dae-optimizing",
       "--dce",
       "--duplicate-function-elimination",
+      "--enclose-world",
       "--gto",
       "--inlining",
       "--inlining-optimizing",
@@ -277,7 +294,7 @@ struct Reducer
       "--optimize-instructions",
       "--precompute",
       "--remove-imports",
-      "--remove-memory",
+      "--remove-memory-init",
       "--remove-unused-names --remove-unused-brs",
       "--remove-unused-module-elements",
       "--remove-unused-nonfunction-module-elements",
@@ -287,6 +304,7 @@ struct Reducer
       "--simplify-globals",
       "--simplify-locals --vacuum",
       "--strip",
+      "--remove-unused-types --closed-world",
       "--vacuum"};
     auto oldSize = file_size(working);
     bool more = true;
@@ -312,7 +330,7 @@ struct Reducer
             if (ProgramResult(command) == expected) {
               std::cerr << "|    command \"" << currCommand
                         << "\" succeeded, reduced size to " << newSize << '\n';
-              copy_file(test, working);
+              applyTestToWorking();
               more = true;
               oldSize = newSize;
             }
@@ -322,6 +340,16 @@ struct Reducer
     }
     if (verbose) {
       std::cerr << "|    done with passes for now\n";
+    }
+  }
+
+  // Apply the test file to the working file, after we saw that it successfully
+  // reduced the testcase.
+  void applyTestToWorking() {
+    copy_file(test, working);
+
+    if (saveAllWorkingFiles) {
+      copy_file(working, working + '.' + std::to_string(workingFileIndex++));
     }
   }
 
@@ -352,7 +380,10 @@ struct Reducer
   }
 
   void loadWorking() {
-    module = make_unique<Module>();
+    module = std::make_unique<Module>();
+
+    toolOptions.applyOptionsBeforeParse(*module);
+
     ModuleReader reader;
     try {
       reader.read(working, *module);
@@ -362,16 +393,15 @@ struct Reducer
       Fatal() << "error in parsing working wasm binary";
     }
 
+    toolOptions.applyOptionsAfterParse(*module);
+
     // If there is no features section, assume we may need them all (without
     // this, a module with no features section but that uses e.g. atomics and
     // bulk memory would not work).
     if (!module->hasFeaturesSection) {
       module->features = FeatureSet::All;
     }
-    // Apply features the user passed on the commandline.
-    toolOptions.applyFeatures(*module);
-
-    builder = make_unique<Builder>(*module);
+    builder = std::make_unique<Builder>(*module);
     setModule(module.get());
   }
 
@@ -392,7 +422,7 @@ struct Reducer
 
   bool writeAndTestReduction(ProgramResult& out) {
     // write the module out
-    ModuleWriter writer;
+    ModuleWriter writer(toolOptions.passOptions);
     writer.setBinary(binary);
     writer.setDebugInfo(debugInfo);
     writer.write(*getModule(), test);
@@ -459,7 +489,7 @@ struct Reducer
 
   void noteReduction(size_t amount = 1) {
     reduced += amount;
-    copy_file(test, working);
+    applyTestToWorking();
   }
 
   // tests a reduction on an arbitrary child
@@ -596,6 +626,25 @@ struct Reducer
         // here to avoid reaching the code below that tries to add a drop on
         // children (which would recreate the current state).
         return;
+      }
+    } else if (auto* structNew = curr->dynCast<StructNew>()) {
+      // If all the fields are defaultable, try to replace this with a
+      // struct.new_with_default.
+      if (!structNew->isWithDefault() && structNew->type != Type::unreachable) {
+        auto& fields = structNew->type.getHeapType().getStruct().fields;
+        if (std::all_of(fields.begin(), fields.end(), [&](auto& field) {
+              return field.type.isDefaultable();
+            })) {
+          ExpressionList operands(getModule()->allocator);
+          operands.swap(structNew->operands);
+          assert(structNew->isWithDefault());
+          if (tryToReplaceCurrent(structNew)) {
+            return;
+          } else {
+            structNew->operands.swap(operands);
+            assert(!structNew->isWithDefault());
+          }
+        }
       }
     }
     // Finally, try to replace with a child.
@@ -845,18 +894,13 @@ struct Reducer
       reduceByZeroing(
         segment.get(),
         first,
-        [&](Expression* entry) {
-          if (entry->is<RefNull>()) {
-            // we don't need to replace a ref.null
+        [&](Expression* elem) {
+          if (elem->is<RefNull>()) {
+            // We don't need to replace a ref.null.
             return true;
-          } else if (first->is<RefNull>()) {
-            return false;
-          } else {
-            // Both are ref.func
-            auto* f = first->cast<RefFunc>();
-            auto* e = entry->cast<RefFunc>();
-            return f->func == e->func;
           }
+          // Is the element equal to our first "zero" element?
+          return ExpressionAnalyzer::equal(first, elem);
         },
         1,
         shrank);
@@ -1077,7 +1121,7 @@ struct Reducer
         }
       }
       void visitExport(Export* curr) {
-        if (names.count(curr->value)) {
+        if (auto* name = curr->getInternalName(); name && names.count(*name)) {
           exportsToRemove.push_back(curr->name);
         }
       }
@@ -1133,33 +1177,47 @@ struct Reducer
     return false;
   }
 
-  // try to replace a concrete value with a trivial constant
+  // Try to replace a concrete value with a trivial constant.
   bool tryToReduceCurrentToConst() {
     auto* curr = getCurrent();
-    if (curr->is<Const>()) {
-      return false;
-    }
-    // try to replace with a trivial value
-    if (curr->type.isNullable()) {
+
+    // References.
+    if (curr->type.isNullable() && !curr->is<RefNull>()) {
       RefNull* n = builder->makeRefNull(curr->type.getHeapType());
       return tryToReplaceCurrent(n);
     }
+
+    // Tuples.
     if (curr->type.isTuple() && curr->type.isDefaultable()) {
       Expression* n =
         builder->makeConstantExpression(Literal::makeZeros(curr->type));
+      if (ExpressionAnalyzer::equal(n, curr)) {
+        return false;
+      }
       return tryToReplaceCurrent(n);
     }
+
+    // Numbers. We try to replace them with a 0 or a 1.
     if (!curr->type.isNumber()) {
       return false;
     }
-    // It's a number: try to replace it with a 0 or a 1 (trying more values
-    // could make sense too, but these handle most cases).
+    auto* existing = curr->dynCast<Const>();
+    if (existing && existing->value.isZero()) {
+      // It's already a zero.
+      return false;
+    }
     auto* c = builder->makeConst(Literal::makeZero(curr->type));
     if (tryToReplaceCurrent(c)) {
       return true;
     }
+    // It's not a zero, and can't be replaced with a zero. Try to make it a one,
+    // if it isn't already.
+    if (existing &&
+        existing->value == Literal::makeFromInt32(1, existing->type)) {
+      // It's already a one.
+      return false;
+    }
     c->value = Literal::makeOne(curr->type);
-    c->type = curr->type;
     return tryToReplaceCurrent(c);
   }
 
@@ -1207,7 +1265,7 @@ int main(int argc, const char* argv[]) {
          [&](Options* o, const std::string& argument) { command = argument; })
     .add("--test",
          "-t",
-         "Test file (this will be written to to test, the given command should "
+         "Test file (this will be written to test, the given command should "
          "read it when we call it)",
          WasmReduceOption,
          Options::Arguments::One,
@@ -1281,6 +1339,15 @@ int main(int argc, const char* argv[]) {
            extraFlags = argument;
            std::cout << "|applying extraFlags: " << extraFlags << "\n";
          })
+    .add("--save-all-working",
+         "-saw",
+         "Save all intermediate working files, as $WORKING.0, .1, .2 etc",
+         WasmReduceOption,
+         Options::Arguments::Zero,
+         [&](Options* o, const std::string& argument) {
+           saveAllWorkingFiles = true;
+           std::cout << "|saving all intermediate working files\n";
+         })
     .add_positional(
       "INFILE",
       Options::Arguments::One,
@@ -1289,13 +1356,6 @@ int main(int argc, const char* argv[]) {
 
   if (debugInfo) {
     extraFlags += " -g ";
-  }
-  if (getTypeSystem() == TypeSystem::Nominal) {
-    extraFlags += " --nominal";
-  } else if (getTypeSystem() == TypeSystem::Isorecursive) {
-    extraFlags += " --hybrid";
-  } else {
-    WASM_UNREACHABLE("unexpected type system");
   }
 
   if (test.size() == 0) {
@@ -1352,7 +1412,7 @@ int main(int argc, const char* argv[]) {
     if (resultOnInvalid == expected) {
       // Try it on a valid input.
       Module emptyModule;
-      ModuleWriter writer;
+      ModuleWriter writer(options.passOptions);
       writer.setBinary(true);
       writer.write(emptyModule, test);
       ProgramResult resultOnValid(command);

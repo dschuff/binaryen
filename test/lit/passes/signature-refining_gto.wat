@@ -1,25 +1,25 @@
-;; RUN: foreach %s %t wasm-opt --closed-world --nominal --signature-refining --gto                       --roundtrip -all -S -o - | filecheck %s
-;; RUN: foreach %s %t wasm-opt --closed-world           --signature-refining --gto --remove-unused-types --roundtrip -all -S -o - | filecheck %s --check-prefix ISOREC
+;; RUN: wasm-opt %s -all --closed-world --preserve-type-order \
+;; RUN:     --signature-refining --gto --remove-unused-types --roundtrip -S -o - | filecheck %s
 
 ;; Check that type $A is not included in the final binary after the signature
-;; refining optimization. For isorecursive types, this requires an additional
-;; --remove-unused-types pass after signature refining.
+;; refining optimization and an additional --remove-unused-types pass.
 
 (module
  ;; The type $A should not be emitted at all (see below).
  ;; CHECK-NOT: (type $A
- ;; ISOREC-NOT: (type $A
  (type $A (struct (field (mut (ref null $A)))))
 
- ;; CHECK:      (type $ref|none|_=>_none (func (param (ref none))))
+ ;; CHECK:      (type $0 (func (param (ref none))))
 
- ;; CHECK:      (type $funcref_i32_=>_none (func (param funcref i32)))
+ ;; CHECK:      (type $1 (func (param funcref i32)))
 
- ;; CHECK:      (func $struct.get (type $ref|none|_=>_none) (param $0 (ref none))
+ ;; CHECK:      (func $struct.get (type $0) (param $0 (ref none))
  ;; CHECK-NEXT:  (drop
  ;; CHECK-NEXT:   (local.get $0)
  ;; CHECK-NEXT:  )
- ;; CHECK-NEXT:  (unreachable)
+ ;; CHECK-NEXT:  (drop
+ ;; CHECK-NEXT:   (unreachable)
+ ;; CHECK-NEXT:  )
  ;; CHECK-NEXT: )
  (func $struct.get (param $0 (ref $A))
   ;; This function is always called with a null, so the parameter type will be
@@ -34,7 +34,7 @@
   )
  )
 
- ;; CHECK:      (func $caller (type $funcref_i32_=>_none) (param $0 funcref) (param $1 i32)
+ ;; CHECK:      (func $caller (type $1) (param $0 funcref) (param $1 i32)
  ;; CHECK-NEXT:  (call $struct.get
  ;; CHECK-NEXT:   (ref.as_non_null
  ;; CHECK-NEXT:    (ref.null none)

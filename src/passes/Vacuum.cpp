@@ -23,7 +23,6 @@
 #include <ir/effects.h>
 #include <ir/iteration.h>
 #include <ir/literal-utils.h>
-#include <ir/type-updating.h>
 #include <ir/utils.h>
 #include <pass.h>
 #include <wasm-builder.h>
@@ -36,32 +35,9 @@ struct Vacuum : public WalkerPass<ExpressionStackWalker<Vacuum>> {
 
   std::unique_ptr<Pass> create() override { return std::make_unique<Vacuum>(); }
 
-  TypeUpdater typeUpdater;
-
-  // The TypeUpdater class handles efficient updating of unreachability as we
-  // go, but we may also refine types, which requires refinalization.
-  bool refinalize = false;
-
-  Expression* replaceCurrent(Expression* expression) {
-    auto* old = getCurrent();
-    if (expression->type != old->type &&
-        expression->type != Type::unreachable) {
-      // We are changing this to a new type that is not unreachable, so it is a
-      // refinement that we need to use refinalize to propagate up.
-      refinalize = true;
-    }
-    super::replaceCurrent(expression);
-    // also update the type updater
-    typeUpdater.noteReplacement(old, expression);
-    return expression;
-  }
-
   void doWalkFunction(Function* func) {
-    typeUpdater.walk(func->body);
     walk(func->body);
-    if (refinalize) {
-      ReFinalize().walkFunctionInModule(func, getModule());
-    }
+    ReFinalize().walkFunctionInModule(func, getModule());
   }
 
   // Returns nullptr if curr is dead, curr if it must stay as is, or one of its
@@ -111,7 +87,7 @@ struct Vacuum : public WalkerPass<ExpressionStackWalker<Vacuum>> {
       // Some instructions have special handling in visit*, and we should do
       // nothing for them here.
       if (curr->is<Drop>() || curr->is<Block>() || curr->is<If>() ||
-          curr->is<Loop>() || curr->is<Try>()) {
+          curr->is<Loop>() || curr->is<Try>() || curr->is<TryTable>()) {
         return curr;
       }
       // Check if this expression itself has side effects, ignoring children.
@@ -154,9 +130,56 @@ struct Vacuum : public WalkerPass<ExpressionStackWalker<Vacuum>> {
   }
 
   void visitBlock(Block* curr) {
+    auto& list = curr->list;
+
+    // If traps are assumed to never happen, we can remove code on paths that
+    // must reach a trap:
+    //
+    //  (block
+    //    (i32.store ..)
+    //    (br_if ..)      ;; execution branches here, so the first store remains
+    //    (i32.store ..)  ;; this store can be removed
+    //    (unreachable);
+    //  )
+    //
+    // For this to be useful we need to have at least 2 elements: something to
+    // remove, and an unreachable.
+    if (getPassOptions().trapsNeverHappen && list.size() >= 2) {
+      // Go backwards. When we find a trap, mark the things before it as heading
+      // to a trap.
+      auto headingToTrap = false;
+      for (int i = list.size() - 1; i >= 0; i--) {
+        if (list[i]->is<Unreachable>()) {
+          headingToTrap = true;
+          continue;
+        }
+
+        if (!headingToTrap) {
+          continue;
+        }
+
+        // Check if we may no longer be heading to a trap. We can only optimize
+        // if the trap will actually be reached. Two situations can prevent that
+        // here: Control flow might branch away, or we might hang (which can
+        // happen in a call or a loop).
+        //
+        // We also cannot remove a pop as it is necessary for structural
+        // reasons.
+        EffectAnalyzer effects(getPassOptions(), *getModule(), list[i]);
+        if (effects.transfersControlFlow() || effects.calls ||
+            effects.mayNotReturn || effects.danglingPop) {
+          headingToTrap = false;
+          continue;
+        }
+
+        // This code can be removed! Turn it into a nop, and leave it for the
+        // code lower down to finish cleaning up.
+        ExpressionManipulator::nop(list[i]);
+      }
+    }
+
     // compress out nops and other dead code
     int skip = 0;
-    auto& list = curr->list;
     size_t size = list.size();
     for (size_t z = 0; z < size; z++) {
       auto* child = list[z];
@@ -185,11 +208,9 @@ struct Vacuum : public WalkerPass<ExpressionStackWalker<Vacuum>> {
         }
       }
       if (!optimized) {
-        typeUpdater.noteRecursiveRemoval(child);
         skip++;
       } else {
         if (optimized != child) {
-          typeUpdater.noteReplacement(child, optimized);
           list[z] = optimized;
         }
         if (skip > 0) {
@@ -198,14 +219,7 @@ struct Vacuum : public WalkerPass<ExpressionStackWalker<Vacuum>> {
         }
         // if this is unreachable, the rest is dead code
         if (list[z - skip]->type == Type::unreachable && z < size - 1) {
-          for (Index i = z - skip + 1; i < list.size(); i++) {
-            auto* remove = list[i];
-            if (remove) {
-              typeUpdater.noteRecursiveRemoval(remove);
-            }
-          }
           list.resize(z - skip + 1);
-          typeUpdater.maybeUpdateTypeToUnreachable(curr);
           skip = 0; // nothing more to do on the list
           break;
         }
@@ -213,7 +227,6 @@ struct Vacuum : public WalkerPass<ExpressionStackWalker<Vacuum>> {
     }
     if (skip > 0) {
       list.resize(size - skip);
-      typeUpdater.maybeUpdateTypeToUnreachable(curr);
     }
     // the block may now be a trivial one that we can get rid of and just leave
     // its contents
@@ -227,15 +240,10 @@ struct Vacuum : public WalkerPass<ExpressionStackWalker<Vacuum>> {
       Expression* child;
       if (value->value.getInteger()) {
         child = curr->ifTrue;
-        if (curr->ifFalse) {
-          typeUpdater.noteRecursiveRemoval(curr->ifFalse);
-        }
       } else {
         if (curr->ifFalse) {
           child = curr->ifFalse;
-          typeUpdater.noteRecursiveRemoval(curr->ifTrue);
         } else {
-          typeUpdater.noteRecursiveRemoval(curr);
           ExpressionManipulator::nop(curr);
           return;
         }
@@ -245,14 +253,42 @@ struct Vacuum : public WalkerPass<ExpressionStackWalker<Vacuum>> {
     }
     // if the condition is unreachable, just return it
     if (curr->condition->type == Type::unreachable) {
-      typeUpdater.noteRecursiveRemoval(curr->ifTrue);
-      if (curr->ifFalse) {
-        typeUpdater.noteRecursiveRemoval(curr->ifFalse);
-      }
       replaceCurrent(curr->condition);
       return;
     }
     // from here on, we can assume the condition executed
+
+    // In trapsNeverHappen mode, a definitely-trapping arm can be assumed to not
+    // happen. Such conditional code can be assumed to never be reached in this
+    // mode.
+    //
+    // Ignore the case of an unreachable if, such as having both arms be
+    // unreachable. In that case we'd need to fix up the IR to avoid changing
+    // the type; leave that for DCE to simplify first. After checking that
+    // curr->type != unreachable, we can assume that only one of the arms is
+    // unreachable (at most).
+    if (getPassOptions().trapsNeverHappen && curr->type != Type::unreachable) {
+      auto optimizeArm = [&](Expression* arm, Expression* otherArm) {
+        if (!arm->is<Unreachable>()) {
+          return false;
+        }
+        Builder builder(*getModule());
+        Expression* rep = builder.makeDrop(curr->condition);
+        if (otherArm) {
+          rep = builder.makeSequence(rep, otherArm);
+        }
+        replaceCurrent(rep);
+        return true;
+      };
+
+      // As mentioned above, do not try to optimize both arms; leave that case
+      // for DCE.
+      if (optimizeArm(curr->ifTrue, curr->ifFalse) ||
+          (curr->ifFalse && optimizeArm(curr->ifFalse, curr->ifTrue))) {
+        return;
+      }
+    }
+
     if (curr->ifFalse) {
       if (curr->ifFalse->is<Nop>()) {
         curr->ifFalse = nullptr;
@@ -384,9 +420,6 @@ struct Vacuum : public WalkerPass<ExpressionStackWalker<Vacuum>> {
     // the try's body.
     if (!EffectAnalyzer(getPassOptions(), *getModule(), curr->body).throws()) {
       replaceCurrent(curr->body);
-      for (auto* catchBody : curr->catchBodies) {
-        typeUpdater.noteRecursiveRemoval(catchBody);
-      }
       return;
     }
 
@@ -398,8 +431,16 @@ struct Vacuum : public WalkerPass<ExpressionStackWalker<Vacuum>> {
     if (curr->type == Type::none && curr->hasCatchAll() &&
         !EffectAnalyzer(getPassOptions(), *getModule(), curr)
            .hasUnremovableSideEffects()) {
-      typeUpdater.noteRecursiveRemoval(curr);
       ExpressionManipulator::nop(curr);
+    }
+  }
+
+  void visitTryTable(TryTable* curr) {
+    // If try_table's body does not throw, the whole try_table can be replaced
+    // with the try_table's body.
+    if (!EffectAnalyzer(getPassOptions(), *getModule(), curr->body).throws()) {
+      replaceCurrent(curr->body);
+      return;
     }
   }
 
