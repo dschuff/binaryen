@@ -177,10 +177,10 @@ void RunCallgraphAnalysis(Module* module, std::vector<EntryPointGroup> entrypoin
   }
   if (entrypoints.empty()) {
     for (auto& ex : module->exports) {
-      std::cout << "Export " << ex->name << " with value " << ex->value <<'\n';
+      std::cout << "Export " << ex->name << " with value " << ex->getInternalName() <<'\n';
       if (ex->kind != ExternalKind::Function) continue;
-      if (module->getFunction(ex->value)->imported()) continue;
-      entrypoints.push_back({ex->value});
+      if (module->getFunction(*ex->getInternalName())->imported()) continue;
+      entrypoints.push_back({*ex->getInternalName()});
     }
   }
 
