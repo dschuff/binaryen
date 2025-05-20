@@ -481,6 +481,25 @@ if(BUILD_LLVM_DWARF)
   target_link_libraries(binaryen llvm_dwarf)
 endif()
 
+option(WITH_ZLIB "Enable zlib for reading gzipped input files" ON)
+
+if(WITH_ZLIB)
+  find_package(ZLIB)
+  if(ZLIB_FOUND)
+    message(STATUS "Found ZLIB: ${ZLIB_LIBRARIES} (version ${ZLIB_VERSION_STRING}), enabling gzip support.")
+    # Add compile definition for the library itself and for consumers
+    # This makes BINARYEN_HAS_ZLIB available in C++
+    target_compile_definitions(binaryen PUBLIC BINARYEN_HAS_ZLIB)
+    # Link zlib to binaryen and propagate the dependency to consumers
+    target_link_libraries(binaryen ZLIB::ZLIB)
+  else()
+    message(STATUS "ZLIB not found. Building without gzip support. Gzipped input files will not be automatically decompressed.")
+  endif()
+else()
+  message(STATUS "ZLIB support disabled via WITH_ZLIB option. Building without gzip support. Gzipped input files will not be automatically decompressed.")
+endif()
+
+
 if(BUILD_MIMALLOC)
   if(NOT(CMAKE_SYSTEM_NAME STREQUAL "Linux") OR EMSCRIPTEN)
     message(FATAL_ERROR "Linking mimalloc is only supported on Linux.")

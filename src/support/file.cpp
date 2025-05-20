@@ -24,6 +24,10 @@
 #include <iostream>
 #include <limits>
 
+#include <vector>
+#include <string>
+#include <type_traits> // For std::is_same_v
+#include <zlib.h>
 #define DEBUG_TYPE "file"
 
 std::vector<char> wasm::read_stdin() {
@@ -52,40 +56,86 @@ T wasm::read_file(const std::string& filename, Flags::BinaryOption binary) {
   if (filename == "-") {
     return do_read_stdin<T>{}();
   }
-  BYN_TRACE("Loading '" << filename << "'...\n");
-  std::ifstream infile;
-  std::ios_base::openmode flags = std::ifstream::in;
-  if (binary == Flags::Binary) {
-    flags |= std::ifstream::binary;
+
+  Path::PathString path_obj = wasm::Path::to_path(filename);
+
+  // First, try to open in binary mode to check for gzip magic bytes
+  std::ifstream magic_check_file(path_obj, std::ios::in | std::ios::binary);
+  if (!magic_check_file.is_open()) {
+    Fatal() << "Failed opening '" << filename << "' for magic number check";
   }
-  infile.open(wasm::Path::to_path(filename), flags);
-  if (!infile.is_open()) {
-    Fatal() << "Failed opening '" << filename << "'";
-  }
-  infile.seekg(0, std::ios::end);
-  std::streampos insize = infile.tellg();
-  if (uint64_t(insize) >= std::numeric_limits<size_t>::max()) {
-    // Building a 32-bit executable where size_t == 32 bits, we are not able to
-    // create strings larger than 2^32 bytes in length, so must abort here.
-    Fatal() << "Failed opening '" << filename
-            << "': Input file too large: " << insize
-            << " bytes. Try rebuilding in 64-bit mode.";
-  }
-  // Zero-initialize the string or vector with the expected size.
-  T input(size_t(insize), '\0');
-  if (size_t(insize) == 0) {
+
+  char magic_bytes[2];
+  magic_check_file.read(magic_bytes, 2);
+
+  if (magic_check_file.gcount() == 2 &&
+      static_cast<unsigned char>(magic_bytes[0]) == 0x1f &&
+      static_cast<unsigned char>(magic_bytes[1]) == 0x8b) {
+    // File is gzipped
+    magic_check_file.close();
+    BYN_TRACE("Loading gzipped '" << filename << "'...\n");
+
+#ifdef USE_WSTRING_PATHS
+    gzFile gzfp = gzopen(wasm::Path::wstring_to_string(path_obj).c_str(), "rb");
+#else
+    gzFile gzfp = gzopen(path_obj.c_str(), "rb");
+#endif
+    if (!gzfp) {
+      Fatal() << "gzopen failed for '" << filename << "'";
+    }
+
+    std::vector<char> decompressed_data;
+    char chunk_buffer[16384]; // 16KB chunk size
+    int gz_errnum;
+    int bytes_read;
+    while ((bytes_read = gzread(gzfp, chunk_buffer, sizeof(chunk_buffer))) > 0) {
+      decompressed_data.insert(decompressed_data.end(), chunk_buffer, chunk_buffer + bytes_read);
+    }
+
+    if (bytes_read < 0) {
+      const char * error_string = gzerror(gzfp, &gz_errnum);
+      gzclose(gzfp);
+      Fatal() << "Failed reading gzipped file '" << filename << "': " << error_string << " (errnum: " << gz_errnum << ")";
+    }
+    gzclose(gzfp);
+
+    if constexpr (std::is_same_v<T, std::string>) {
+      return T(decompressed_data.begin(), decompressed_data.end());
+    } else { // T is std::vector<char>
+      return decompressed_data;
+    }
+  } else {
+    // Not gzipped, proceed with normal file reading
+    magic_check_file.close(); // Close the file opened for magic check
+    BYN_TRACE("Loading '" << filename << "'...\n");
+    std::ifstream infile;
+    std::ios_base::openmode flags = std::ifstream::in;
+    if (binary == Flags::Binary) {
+      flags |= std::ifstream::binary;
+    }
+    infile.open(path_obj, flags);
+    if (!infile.is_open()) {
+      Fatal() << "Failed opening '" << filename << "'";
+    }
+    infile.seekg(0, std::ios::end);
+    std::streampos insize = infile.tellg();
+    if (uint64_t(insize) >= std::numeric_limits<size_t>::max()) {
+      Fatal() << "Failed opening '" << filename
+              << "': Input file too large: " << insize
+              << " bytes. Try rebuilding in 64-bit mode.";
+    }
+    T input(static_cast<size_t>(insize), '\0');
+    if (static_cast<size_t>(insize) == 0) {
+      return input;
+    }
+    infile.seekg(0);
+    infile.read(&input[0], insize);
+    if (binary == Flags::Text) {
+      size_t chars = static_cast<size_t>(infile.gcount());
+      input.resize(chars);
+    }
     return input;
   }
-  infile.seekg(0);
-  infile.read(&input[0], insize);
-  if (binary == Flags::Text) {
-    size_t chars = size_t(infile.gcount());
-    // Truncate size to the number of ASCII characters actually read in text
-    // mode (which is generally less than the number of bytes on Windows, if
-    // \r\n line endings are present)
-    input.resize(chars);
-  }
-  return input;
 }
 
 std::string wasm::read_possible_response_file(const std::string& input) {
