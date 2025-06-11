@@ -27,7 +27,9 @@
 #include <vector>
 #include <string>
 #include <type_traits> // For std::is_same_v
+#ifdef BINARYEN_HAS_ZLIB
 #include <zlib.h>
+#endif // BINARYEN_HAS_ZLIB
 #define DEBUG_TYPE "file"
 
 std::vector<char> wasm::read_stdin() {
@@ -59,6 +61,7 @@ T wasm::read_file(const std::string& filename, Flags::BinaryOption binary) {
 
   Path::PathString path_obj = wasm::Path::to_path(filename);
 
+#ifdef BINARYEN_HAS_ZLIB
   // First, try to open in binary mode to check for gzip magic bytes
   std::ifstream magic_check_file(path_obj, std::ios::in | std::ios::binary);
   if (!magic_check_file.is_open()) {
@@ -104,38 +107,41 @@ T wasm::read_file(const std::string& filename, Flags::BinaryOption binary) {
     } else { // T is std::vector<char>
       return decompressed_data;
     }
-  } else {
-    // Not gzipped, proceed with normal file reading
-    magic_check_file.close(); // Close the file opened for magic check
-    BYN_TRACE("Loading '" << filename << "'...\n");
-    std::ifstream infile;
-    std::ios_base::openmode flags = std::ifstream::in;
-    if (binary == Flags::Binary) {
-      flags |= std::ifstream::binary;
-    }
-    infile.open(path_obj, flags);
-    if (!infile.is_open()) {
-      Fatal() << "Failed opening '" << filename << "'";
-    }
-    infile.seekg(0, std::ios::end);
-    std::streampos insize = infile.tellg();
-    if (uint64_t(insize) >= std::numeric_limits<size_t>::max()) {
-      Fatal() << "Failed opening '" << filename
-              << "': Input file too large: " << insize
-              << " bytes. Try rebuilding in 64-bit mode.";
-    }
-    T input(static_cast<size_t>(insize), '\0');
-    if (static_cast<size_t>(insize) == 0) {
-      return input;
-    }
-    infile.seekg(0);
-    infile.read(&input[0], insize);
-    if (binary == Flags::Text) {
-      size_t chars = static_cast<size_t>(infile.gcount());
-      input.resize(chars);
-    }
+  }
+  // Not gzipped, or magic check failed to read 2 bytes.
+  magic_check_file.close(); // Close the file opened for magic check
+  // Fall through to normal file reading.
+#endif // BINARYEN_HAS_ZLIB
+
+  // Normal file reading (either not gzipped, or zlib support is disabled)
+  BYN_TRACE("Loading '" << filename << "'...\n");
+  std::ifstream infile;
+  std::ios_base::openmode flags = std::ifstream::in;
+  if (binary == Flags::Binary) {
+    flags |= std::ifstream::binary;
+  }
+  infile.open(path_obj, flags);
+  if (!infile.is_open()) {
+    Fatal() << "Failed opening '" << filename << "'";
+  }
+  infile.seekg(0, std::ios::end);
+  std::streampos insize = infile.tellg();
+  if (uint64_t(insize) >= std::numeric_limits<size_t>::max()) {
+    Fatal() << "Failed opening '" << filename
+            << "': Input file too large: " << insize
+            << " bytes. Try rebuilding in 64-bit mode.";
+  }
+  T input(static_cast<size_t>(insize), '\0');
+  if (static_cast<size_t>(insize) == 0) {
     return input;
   }
+  infile.seekg(0);
+  infile.read(&input[0], insize);
+  if (binary == Flags::Text) {
+    size_t chars = static_cast<size_t>(infile.gcount());
+    input.resize(chars);
+  }
+  return input;
 }
 
 std::string wasm::read_possible_response_file(const std::string& input) {

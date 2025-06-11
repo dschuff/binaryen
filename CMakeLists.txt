@@ -481,7 +481,7 @@ if(BUILD_LLVM_DWARF)
   target_link_libraries(binaryen llvm_dwarf)
 endif()
 
-option(WITH_ZLIB "Enable zlib for reading gzipped input files" ON)
+option(WITH_ZLIB "Enable zlib for reading gzipped input files" OFF)
 
 if(WITH_ZLIB)
   find_package(ZLIB)
