@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 
+#include <algorithm>
 #include <optional>
 #include <random>
 #include <string>
@@ -39,7 +40,7 @@ struct Fuzzer {
   bool verbose;
 
   // Initialized by `run` for checkers and possible later inspection
-  std::vector<HeapTypeDef> types;
+  std::vector<HeapType> types;
   std::vector<std::vector<Index>> subtypeIndices;
   Random rand;
 
@@ -48,7 +49,7 @@ struct Fuzzer {
   // Generate types and run checkers on them.
   void run(uint64_t seed);
 
-  static void printTypes(const std::vector<HeapTypeDef>&);
+  static void printTypes(const std::vector<HeapType>&);
 
   // Checkers for various properties.
   void checkSubtypes() const;
@@ -93,11 +94,11 @@ void Fuzzer::run(uint64_t seed) {
   checkRecGroupShapes();
 }
 
-void Fuzzer::printTypes(const std::vector<HeapTypeDef>& types) {
+void Fuzzer::printTypes(const std::vector<HeapType>& types) {
   std::cout << "Built " << types.size() << " types:\n";
   struct FatalTypeNameGenerator
     : TypeNameGeneratorBase<FatalTypeNameGenerator> {
-    TypeNames getNames(HeapTypeDef type) {
+    TypeNames getNames(HeapType type) {
       Fatal() << "trying to print unknown heap type";
     }
   } fatalGenerator;
@@ -233,7 +234,7 @@ void Fuzzer::checkCanonicalization() {
   // between canonical and temporary components.
   struct Copier {
     Random& rand;
-    const std::vector<HeapTypeDef>& types;
+    const std::vector<HeapType>& types;
     TypeBuilder& builder;
 
     // For each type, the indices in `types` at which it appears.
@@ -262,6 +263,18 @@ void Fuzzer::checkCanonicalization() {
           if (sub != super) {
             builder[sub].subTypeOf(builder[super]);
           }
+        }
+      }
+
+      // Set descriptors.
+      for (size_t i = 0; i < types.size(); ++i) {
+        if (auto desc = types[i].getDescriptorType()) {
+          // The correct descriptor index must be the next one greater than i.
+          auto& descriptors = typeIndices[*desc];
+          auto it = std::lower_bound(descriptors.begin(), descriptors.end(), i);
+          assert(it != descriptors.end());
+          builder[i].descriptor(builder[*it]);
+          builder[*it].describes(builder[i]);
         }
       }
 
@@ -479,8 +492,7 @@ void Fuzzer::checkCanonicalization() {
 }
 
 void Fuzzer::checkInhabitable() {
-  std::vector<HeapTypeDef> inhabitable =
-    HeapTypeGenerator::makeInhabitable(types);
+  std::vector<HeapType> inhabitable = HeapTypeGenerator::makeInhabitable(types);
   if (verbose) {
     std::cout << "\nInhabitable types:\n\n";
     printTypes(inhabitable);
@@ -543,7 +555,7 @@ void Fuzzer::checkRecGroupShapes() {
   };
 
   for (size_t i = 0; i < groups.size(); ++i) {
-    ComparableRecGroupShape shape(groups[i], less);
+    ComparableRecGroupShape shape(groups[i], FeatureSet::All, less);
     // A rec group should compare equal to itself.
     if (shape != shape) {
       Fatal() << "Rec group shape " << i << " not equal to itself";
@@ -557,7 +569,7 @@ void Fuzzer::checkRecGroupShapes() {
 
     // Check how it compares to other groups.
     for (size_t j = i + 1; j < groups.size(); ++j) {
-      ComparableRecGroupShape other(groups[j], less);
+      ComparableRecGroupShape other(groups[j], FeatureSet::All, less);
       bool isLess = shape < other;
       bool isEq = shape == other;
       bool isGreater = shape > other;
@@ -599,7 +611,7 @@ void Fuzzer::checkRecGroupShapes() {
 
       if (j + 1 < groups.size()) {
         // Check transitivity.
-        RecGroupShape third(groups[j + 1]);
+        RecGroupShape third(groups[j + 1], FeatureSet::All);
         if ((isLess && other <= third && shape >= third) ||
             (isEq && other == third && shape != third) ||
             (isGreater && other >= third && shape <= third)) {

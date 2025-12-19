@@ -172,6 +172,9 @@
 ;; CHECK-NEXT:   --inlining-optimizing                         inline functions and optimizes
 ;; CHECK-NEXT:                                                 where we inlined
 ;; CHECK-NEXT:
+;; CHECK-NEXT:   --instrument-branch-hints                     instrument branch hints so we
+;; CHECK-NEXT:                                                 can see which guessed right
+;; CHECK-NEXT:
 ;; CHECK-NEXT:   --instrument-locals                           instrument the build with code
 ;; CHECK-NEXT:                                                 to intercept all loads and
 ;; CHECK-NEXT:                                                 stores
@@ -252,13 +255,6 @@
 ;; CHECK-NEXT:
 ;; CHECK-NEXT:   --minimize-rec-groups                         Split types into minimal
 ;; CHECK-NEXT:                                                 recursion groups
-;; CHECK-NEXT:
-;; CHECK-NEXT:   --mod-asyncify-always-and-only-unwind         apply the assumption that
-;; CHECK-NEXT:                                                 asyncify imports always unwind,
-;; CHECK-NEXT:                                                 and we never rewind
-;; CHECK-NEXT:
-;; CHECK-NEXT:   --mod-asyncify-never-unwind                   apply the assumption that
-;; CHECK-NEXT:                                                 asyncify never unwinds
 ;; CHECK-NEXT:
 ;; CHECK-NEXT:   --monomorphize                                creates specialized versions of
 ;; CHECK-NEXT:                                                 functions
@@ -382,6 +378,9 @@
 ;; CHECK-NEXT:                                                 frequency
 ;; CHECK-NEXT:
 ;; CHECK-NEXT:   --reorder-locals                              sorts locals by access frequency
+;; CHECK-NEXT:
+;; CHECK-NEXT:   --reorder-types                               sorts private types by access
+;; CHECK-NEXT:                                                 frequency
 ;; CHECK-NEXT:
 ;; CHECK-NEXT:   --rereloop                                    re-optimize control flow using
 ;; CHECK-NEXT:                                                 the relooper algorithm
@@ -522,8 +521,8 @@
 ;; CHECK-NEXT:                                                 type fields where possible
 ;; CHECK-NEXT:                                                 (using GUFA)
 ;; CHECK-NEXT:
-;; CHECK-NEXT:   --type-ssa                                    create new nominal types to help
-;; CHECK-NEXT:                                                 other optimizations
+;; CHECK-NEXT:   --type-ssa                                    create new types to help other
+;; CHECK-NEXT:                                                 optimizations
 ;; CHECK-NEXT:
 ;; CHECK-NEXT:   --type-unfinalizing                           mark all types as non-final
 ;; CHECK-NEXT:                                                 (open)
@@ -594,6 +593,9 @@
 ;; CHECK-NEXT:                                                 inlined when there is only one
 ;; CHECK-NEXT:                                                 caller (default -1, which means
 ;; CHECK-NEXT:                                                 all such functions are inlined)
+;; CHECK-NEXT:
+;; CHECK-NEXT:   --inline-max-combined-binary-size,-imcbs      Max size of combined functions
+;; CHECK-NEXT:                                                 after inlining. Default: 409600
 ;; CHECK-NEXT:
 ;; CHECK-NEXT:   --inline-functions-with-loops,-ifwl           Allow inlining functions with
 ;; CHECK-NEXT:                                                 loops

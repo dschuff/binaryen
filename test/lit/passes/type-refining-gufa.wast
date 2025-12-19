@@ -33,7 +33,7 @@
     ;; O3O3-NEXT:  (type $A (sub (struct)))
     (type $A (sub (struct (field (mut anyref)))))
     ;; NRML:       (type $B (sub (struct (field (mut anyref)))))
-    ;; GUFA:       (type $B (sub (struct (field (mut (ref null $A))))))
+    ;; GUFA:       (type $B (sub (struct (field (mut (ref null (exact $A)))))))
     ;; O3O3:       (type $B (sub (struct (field anyref))))
     (type $B (sub (struct (field (mut anyref)))))
   )
@@ -83,7 +83,7 @@
   ;; GUFA:      (export "work" (func $work))
 
   ;; GUFA:      (func $get_from_global (type $2) (param $x i32) (result anyref)
-  ;; GUFA-NEXT:  (if (result (ref null $A))
+  ;; GUFA-NEXT:  (if (result (ref null (exact $A)))
   ;; GUFA-NEXT:   (local.get $x)
   ;; GUFA-NEXT:   (then
   ;; GUFA-NEXT:    (struct.get $A 0
@@ -188,14 +188,14 @@
   ;; GUFA-NEXT:  )
   ;; GUFA-NEXT:  (local.set $b
   ;; GUFA-NEXT:   (struct.new $B
-  ;; GUFA-NEXT:    (ref.cast (ref null $A)
+  ;; GUFA-NEXT:    (ref.cast (ref null (exact $A))
   ;; GUFA-NEXT:     (local.get $a)
   ;; GUFA-NEXT:    )
   ;; GUFA-NEXT:   )
   ;; GUFA-NEXT:  )
   ;; GUFA-NEXT:  (local.set $b
   ;; GUFA-NEXT:   (struct.new $B
-  ;; GUFA-NEXT:    (ref.cast (ref null $A)
+  ;; GUFA-NEXT:    (ref.cast (ref null (exact $A))
   ;; GUFA-NEXT:     (call $get_from_global
   ;; GUFA-NEXT:      (local.get $x)
   ;; GUFA-NEXT:     )
@@ -217,7 +217,7 @@
   ;; GUFA-NEXT:  )
   ;; GUFA-NEXT: )
   ;; O3O3:      (func $work (type $3) (param $0 i32)
-  ;; O3O3-NEXT:  (local $1 (ref $B))
+  ;; O3O3-NEXT:  (local $1 (ref (exact $B)))
   ;; O3O3-NEXT:  (local.set $1
   ;; O3O3-NEXT:   (struct.new $B
   ;; O3O3-NEXT:    (if (result anyref)
@@ -383,3 +383,241 @@
   ;; GUFA:      (global $C (ref $struct) (struct.new_default $struct))
   (global $C (ref $struct) (struct.new_default $struct))
 )
+
+;; As above, but $struct has a supertype. We must propagate restrictions on it
+;; to its supertype. After doing so, we can refine the field to (ref func) in
+;; both, but no further, because of the restriction of global.get $A, which has
+;; that type.
+(module
+  (rec
+    ;; NRML:      (rec
+    ;; NRML-NEXT:  (type $super (sub (struct (field (ref func)))))
+    ;; GUFA:      (rec
+    ;; GUFA-NEXT:  (type $super (sub (struct (field (ref func)))))
+    (type $super (sub (struct (field funcref))))
+    ;; NRML:       (type $struct (sub $super (struct (field (ref func)))))
+    ;; GUFA:       (type $struct (sub $super (struct (field (ref func)))))
+    (type $struct (sub $super (struct (field funcref))))
+  )
+
+  ;; NRML:       (type $func (func))
+  ;; GUFA:       (type $func (func))
+  (type $func (func))
+
+  ;; NRML:      (global $A (ref func) (ref.func $func))
+  ;; GUFA:      (global $A (ref func) (ref.func $func))
+  (global $A (ref func) (ref.func $func))
+
+  ;; NRML:      (global $B (ref $struct) (struct.new $struct
+  ;; NRML-NEXT:  (global.get $A)
+  ;; NRML-NEXT: ))
+  ;; GUFA:      (global $B (ref $struct) (struct.new $struct
+  ;; GUFA-NEXT:  (global.get $A)
+  ;; GUFA-NEXT: ))
+  (global $B (ref $struct) (struct.new $struct
+    (global.get $A)
+  ))
+
+  ;; NRML:      (func $func (type $func)
+  ;; NRML-NEXT: )
+  ;; GUFA:      (func $func (type $func)
+  ;; GUFA-NEXT: )
+  (func $func (type $func)
+  )
+)
+
+;; Regression test for an assertion failure on packed data reads from null
+;; references.
+(module
+ (type $i8 (struct (field i8)))
+
+ ;; NRML:      (type $0 (func (param (ref none)) (result i32)))
+
+ ;; NRML:      (table $0 1 funcref)
+ ;; GUFA:      (type $0 (func (param (ref none)) (result i32)))
+
+ ;; GUFA:      (table $0 1 funcref)
+ ;; O3O3:      (type $0 (func (param (ref none)) (result i32)))
+
+ ;; O3O3:      (table $0 1 funcref)
+ (table $0 1 funcref)
+ ;; NRML:      (elem $0 (i32.const 0) $test)
+ ;; GUFA:      (elem $0 (i32.const 0) $test)
+ ;; O3O3:      (elem $0 (i32.const 0) $test)
+ (elem $0 (i32.const 0) $test)
+
+ ;; NRML:      (export "table" (table $0))
+ ;; GUFA:      (export "table" (table $0))
+ ;; O3O3:      (export "table" (table $0))
+ (export "table" (table $0))
+
+ ;; NRML:      (func $test (type $0) (param $i8 (ref none)) (result i32)
+ ;; NRML-NEXT:  (block ;; (replaces unreachable StructGet we can't emit)
+ ;; NRML-NEXT:   (drop
+ ;; NRML-NEXT:    (local.get $i8)
+ ;; NRML-NEXT:   )
+ ;; NRML-NEXT:   (unreachable)
+ ;; NRML-NEXT:  )
+ ;; NRML-NEXT: )
+ ;; GUFA:      (func $test (type $0) (param $i8 (ref none)) (result i32)
+ ;; GUFA-NEXT:  (block ;; (replaces unreachable StructGet we can't emit)
+ ;; GUFA-NEXT:   (drop
+ ;; GUFA-NEXT:    (local.get $i8)
+ ;; GUFA-NEXT:   )
+ ;; GUFA-NEXT:   (unreachable)
+ ;; GUFA-NEXT:  )
+ ;; GUFA-NEXT: )
+ ;; O3O3:      (func $test (type $0) (param $0 (ref none)) (result i32)
+ ;; O3O3-NEXT:  (unreachable)
+ ;; O3O3-NEXT: )
+ (func $test (param $i8 (ref none)) (result i32)
+  (struct.get_s $i8 0
+   (local.get $i8)
+  )
+ )
+)
+
+;; $wrap-cont has a continuation field, a type which we must not modify. There
+;; are other optimization opportunities in the module ($wrap-array's field can
+;; become exact), so we end up optimizing here. While doing so, we must not
+;; change the continuation type (due to cast limitations), and we must not get
+;; confused and think there is no value in that field because of that
+;; restriction (if we did, the outer struct.get in $a would trap, as it would be
+;; reading from a place nothing was written to, so it would need to be
+;; unreachable).
+(module
+ ;; NRML:      (type $func (func))
+ ;; GUFA:      (type $func (func))
+ ;; O3O3:      (type $func (func))
+ (type $func (func))
+ (rec
+  ;; NRML:      (rec
+  ;; NRML-NEXT:  (type $cont (cont $func))
+  ;; GUFA:      (rec
+  ;; GUFA-NEXT:  (type $cont (cont $func))
+  ;; O3O3:      (rec
+  ;; O3O3-NEXT:  (type $cont (cont $func))
+  (type $cont (cont $func))
+  ;; NRML:       (type $wrap-cont (struct (field (ref $cont))))
+  ;; GUFA:       (type $wrap-cont (struct (field (ref $cont))))
+  ;; O3O3:       (type $wrap-cont (struct (field (ref $cont))))
+  (type $wrap-cont (struct (field (ref $cont))))
+ )
+ ;; NRML:      (rec
+ ;; NRML-NEXT:  (type $array (array i32))
+ ;; GUFA:      (rec
+ ;; GUFA-NEXT:  (type $array (array i32))
+ (type $array (array i32))
+ ;; NRML:       (type $wrap-array (sub (struct (field (ref (exact $array))))))
+ ;; GUFA:       (type $wrap-array (sub (struct (field (ref (exact $array))))))
+ (type $wrap-array (sub (struct (field (ref $array)))))
+
+ ;; NRML:      (type $5 (func (result (ref $cont))))
+
+ ;; NRML:      (elem declare func $ref)
+
+ ;; NRML:      (export "a" (func $a))
+ ;; GUFA:      (type $5 (func (result (ref $cont))))
+
+ ;; GUFA:      (elem declare func $ref)
+
+ ;; GUFA:      (export "a" (func $a))
+ ;; O3O3:      (type $3 (func (result (ref $cont))))
+
+ ;; O3O3:      (elem declare func $ref)
+
+ ;; O3O3:      (export "a" (func $a))
+ (export "a" (func $a))
+ ;; NRML:      (export "b" (func $b))
+ ;; GUFA:      (export "b" (func $b))
+ ;; O3O3:      (export "b" (func $b))
+ (export "b" (func $b))
+
+ ;; NRML:      (func $a (type $func)
+ ;; NRML-NEXT:  (drop
+ ;; NRML-NEXT:   (struct.get $wrap-cont 0
+ ;; NRML-NEXT:    (struct.new $wrap-cont
+ ;; NRML-NEXT:     (cont.new $cont
+ ;; NRML-NEXT:      (ref.func $ref)
+ ;; NRML-NEXT:     )
+ ;; NRML-NEXT:    )
+ ;; NRML-NEXT:   )
+ ;; NRML-NEXT:  )
+ ;; NRML-NEXT: )
+ ;; GUFA:      (func $a (type $func)
+ ;; GUFA-NEXT:  (drop
+ ;; GUFA-NEXT:   (struct.get $wrap-cont 0
+ ;; GUFA-NEXT:    (struct.new $wrap-cont
+ ;; GUFA-NEXT:     (cont.new $cont
+ ;; GUFA-NEXT:      (ref.func $ref)
+ ;; GUFA-NEXT:     )
+ ;; GUFA-NEXT:    )
+ ;; GUFA-NEXT:   )
+ ;; GUFA-NEXT:  )
+ ;; GUFA-NEXT: )
+ ;; O3O3:      (func $a (type $func)
+ ;; O3O3-NEXT:  (drop
+ ;; O3O3-NEXT:   (cont.new $cont
+ ;; O3O3-NEXT:    (ref.func $ref)
+ ;; O3O3-NEXT:   )
+ ;; O3O3-NEXT:  )
+ ;; O3O3-NEXT: )
+ (func $a
+  ;; GUFA cannot improve things here (-O3 can remove the struct operations,
+  ;; though).
+  (drop
+   (struct.get $wrap-cont 0
+    (struct.new $wrap-cont
+     (cont.new $cont
+      (ref.func $ref)
+     )
+    )
+   )
+  )
+ )
+
+ ;; NRML:      (func $b (type $5) (result (ref $cont))
+ ;; NRML-NEXT:  (unreachable)
+ ;; NRML-NEXT: )
+ ;; GUFA:      (func $b (type $5) (result (ref $cont))
+ ;; GUFA-NEXT:  (unreachable)
+ ;; GUFA-NEXT: )
+ ;; O3O3:      (func $b (type $3) (result (ref $cont))
+ ;; O3O3-NEXT:  (unreachable)
+ ;; O3O3-NEXT: )
+ (func $b (result (ref $cont))
+  (unreachable)
+ )
+
+ ;; NRML:      (func $ref (type $func)
+ ;; NRML-NEXT:  (drop
+ ;; NRML-NEXT:   (struct.new $wrap-array
+ ;; NRML-NEXT:    (array.new_default $array
+ ;; NRML-NEXT:     (i32.const 0)
+ ;; NRML-NEXT:    )
+ ;; NRML-NEXT:   )
+ ;; NRML-NEXT:  )
+ ;; NRML-NEXT: )
+ ;; GUFA:      (func $ref (type $func)
+ ;; GUFA-NEXT:  (drop
+ ;; GUFA-NEXT:   (struct.new $wrap-array
+ ;; GUFA-NEXT:    (array.new_default $array
+ ;; GUFA-NEXT:     (i32.const 0)
+ ;; GUFA-NEXT:    )
+ ;; GUFA-NEXT:   )
+ ;; GUFA-NEXT:  )
+ ;; GUFA-NEXT: )
+ ;; O3O3:      (func $ref (type $func)
+ ;; O3O3-NEXT:  (nop)
+ ;; O3O3-NEXT: )
+ (func $ref (type $func)
+  (drop
+   (struct.new $wrap-array
+    (array.new_default $array
+     (i32.const 0)
+    )
+   )
+  )
+ )
+)
+

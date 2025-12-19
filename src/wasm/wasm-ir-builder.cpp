@@ -19,6 +19,7 @@
 #include "ir/child-typer.h"
 #include "ir/eh-utils.h"
 #include "ir/names.h"
+#include "ir/principal-type.h"
 #include "ir/properties.h"
 #include "ir/utils.h"
 #include "wasm-ir-builder.h"
@@ -37,15 +38,15 @@ namespace wasm {
 
 namespace {
 
-Result<> validateTypeAnnotation(HeapType type, Expression* child) {
-  if (child->type == Type::unreachable) {
-    return Ok{};
-  }
-  if (!child->type.isRef() ||
-      !HeapType::isSubType(child->type.getHeapType(), type)) {
-    return Err{"invalid reference type on stack"};
+Result<> validateTypeAnnotation(Type type, Expression* child) {
+  if (!Type::isSubType(child->type, type)) {
+    return Err{"invalid type on stack"};
   }
   return Ok{};
+}
+
+Result<> validateTypeAnnotation(HeapType type, Expression* child) {
+  return validateTypeAnnotation(Type(type, Nullable), child);
 }
 
 } // anonymous namespace
@@ -79,7 +80,7 @@ MaybeResult<IRBuilder::HoistedVal> IRBuilder::hoistLastValue() {
   if (type == Type::unreachable) {
     // Make sure the top of the stack also has an unreachable expression.
     if (stack.back()->type != Type::unreachable) {
-      push(builder.makeUnreachable());
+      pushSynthetic(builder.makeUnreachable());
     }
     return HoistedVal{Index(index), nullptr};
   }
@@ -88,7 +89,7 @@ MaybeResult<IRBuilder::HoistedVal> IRBuilder::hoistLastValue() {
   CHECK_ERR(scratchIdx);
   expr = builder.makeLocalSet(*scratchIdx, expr);
   auto* get = builder.makeLocalGet(*scratchIdx, type);
-  push(get);
+  pushSynthetic(get);
   return HoistedVal{Index(index), get};
 }
 
@@ -107,7 +108,7 @@ Result<> IRBuilder::packageHoistedValue(const HoistedVal& hoisted,
                                    scope.exprStack.end());
     auto* block = builder.makeBlock(exprs, type);
     scope.exprStack.resize(hoisted.valIndex);
-    push(block);
+    pushSynthetic(block);
   };
 
   auto type = scope.exprStack.back()->type;
@@ -137,24 +138,37 @@ Result<> IRBuilder::packageHoistedValue(const HoistedVal& hoisted,
     scratchIdx = *scratch;
   }
   for (Index i = 1, size = type.size(); i < size; ++i) {
-    push(builder.makeTupleExtract(builder.makeLocalGet(scratchIdx, type), i));
+    pushSynthetic(
+      builder.makeTupleExtract(builder.makeLocalGet(scratchIdx, type), i));
   }
   return Ok{};
 }
 
-void IRBuilder::push(Expression* expr) {
+void IRBuilder::push(Expression* expr, Origin origin) {
   auto& scope = getScope();
   if (expr->type == Type::unreachable) {
     scope.unreachable = true;
   }
   scope.exprStack.push_back(expr);
 
-  applyDebugLoc(expr);
-  if (binaryPos && func && lastBinaryPos != *binaryPos) {
-    func->expressionLocations[expr] =
-      BinaryLocations::Span{BinaryLocation(lastBinaryPos - codeSectionOffset),
-                            BinaryLocation(*binaryPos - codeSectionOffset)};
-    lastBinaryPos = *binaryPos;
+  if (origin == Origin::Binary) {
+    applyDebugLoc(expr);
+    if (binaryPos && func && lastBinaryPos != *binaryPos) {
+      auto span =
+        BinaryLocations::Span{BinaryLocation(lastBinaryPos - codeSectionOffset),
+                              BinaryLocation(*binaryPos - codeSectionOffset)};
+      // Some expressions already have their start noted, and we are just seeing
+      // their last segment (like an Else).
+      auto [iter, inserted] = func->expressionLocations.insert({expr, span});
+      if (!inserted) {
+        // Just update the end.
+        iter->second.end = span.end;
+        // The true start from before is before the start of the current
+        // segment.
+        assert(iter->second.start < span.start);
+      }
+      lastBinaryPos = *binaryPos;
+    }
   }
 
   DBG(std::cerr << "After pushing " << ShallowExpression{expr} << ":\n");
@@ -280,71 +294,13 @@ void IRBuilder::dump() {
 
 struct IRBuilder::ChildPopper
   : UnifiedExpressionVisitor<ChildPopper, Result<>> {
-  struct Subtype {
-    Type bound;
-  };
 
-  struct AnyType {};
-
-  struct AnyReference {};
-
-  struct AnyTuple {
-    size_t arity;
-  };
-
-  struct AnyI8ArrayReference {};
-
-  struct AnyI16ArrayReference {};
-
-  struct Constraint : std::variant<Subtype,
-                                   AnyType,
-                                   AnyReference,
-                                   AnyTuple,
-                                   AnyI8ArrayReference,
-                                   AnyI16ArrayReference> {
-    std::optional<Type> getSubtype() const {
-      if (auto* subtype = std::get_if<Subtype>(this)) {
-        return subtype->bound;
-      }
-      return std::nullopt;
-    }
-    bool isAnyType() const { return std::get_if<AnyType>(this); }
-    bool isAnyReference() const { return std::get_if<AnyReference>(this); }
-    bool isAnyI8ArrayReference() const {
-      return std::get_if<AnyI8ArrayReference>(this);
-    }
-    bool isAnyI16ArrayReference() const {
-      return std::get_if<AnyI16ArrayReference>(this);
-    }
-    std::optional<size_t> getAnyTuple() const {
-      if (auto* tuple = std::get_if<AnyTuple>(this)) {
-        return tuple->arity;
-      }
-      return std::nullopt;
-    }
-    size_t size() const {
-      if (auto type = getSubtype()) {
-        return type->size();
-      }
-      if (auto arity = getAnyTuple()) {
-        return *arity;
-      }
-      return 1;
-    }
-    Constraint operator[](size_t i) const {
-      if (auto type = getSubtype()) {
-        return {Subtype{(*type)[i]}};
-      }
-      if (getAnyTuple()) {
-        return {AnyType{}};
-      }
-      return *this;
-    }
-  };
+  struct ConstraintCollector;
+  using Constraints = ChildTyper<ConstraintCollector>::Constraints;
 
   struct Child {
     Expression** childp;
-    Constraint constraint;
+    Constraints constraint;
   };
 
   struct ConstraintCollector : ChildTyper<ConstraintCollector> {
@@ -355,28 +311,8 @@ struct IRBuilder::ChildPopper
       : ChildTyper(builder.wasm, builder.func), builder(builder),
         children(children) {}
 
-    void noteSubtype(Expression** childp, Type type) {
-      children.push_back({childp, {Subtype{type}}});
-    }
-
-    void noteAnyType(Expression** childp) {
-      children.push_back({childp, {AnyType{}}});
-    }
-
-    void noteAnyReferenceType(Expression** childp) {
-      children.push_back({childp, {AnyReference{}}});
-    }
-
-    void noteAnyTupleType(Expression** childp, size_t arity) {
-      children.push_back({childp, {AnyTuple{arity}}});
-    }
-
-    void noteAnyI8ArrayReferenceType(Expression** childp) {
-      children.push_back({childp, {AnyI8ArrayReference{}}});
-    }
-
-    void noteAnyI16ArrayReferenceType(Expression** childp) {
-      children.push_back({childp, {AnyI16ArrayReference{}}});
+    void note(Expression** childp, Constraints type) {
+      children.push_back({childp, type});
     }
 
     Type getLabelType(Name label) {
@@ -386,7 +322,12 @@ struct IRBuilder::ChildPopper
     void visitIf(If* curr) {
       // Skip the control flow children because we only want to pop the
       // condition.
-      children.push_back({&curr->condition, {Subtype{Type::i32}}});
+      children.push_back({&curr->condition, {Type(Type::i32)}});
+    }
+
+    // It is a bug if we ever have insufficient type information.
+    void noteUnknown() {
+      WASM_UNREACHABLE("unexpected insufficient type information");
     }
   };
 
@@ -398,6 +339,49 @@ private:
   Result<> popConstrainedChildren(std::vector<Child>& children) {
     auto& scope = builder.getScope();
 
+    // The index of the shallowest unreachable instruction on the stack, found
+    // by checkNeedsUnreachableFallback.
+    std::optional<size_t> unreachableIndex;
+
+    // Whether popping the children past the unreachable would produce a type
+    // mismatch or try to pop from an empty stack.
+    bool needUnreachableFallback = false;
+
+    // We only need to check requirements if there is an unreachable.
+    // Otherwise the validator will catch any problems.
+    if (scope.unreachable) {
+      needUnreachableFallback =
+        checkNeedsUnreachableFallback(children, unreachableIndex);
+    }
+
+    // We have checked all the constraints, so we are ready to pop children.
+    for (int i = children.size() - 1; i >= 0; --i) {
+      if (needUnreachableFallback &&
+          scope.exprStack.size() == *unreachableIndex + 1 && i > 0) {
+        // The next item on the stack is the unreachable instruction we must
+        // not pop past. We cannot insert unreachables in front of it because
+        // it might be a branch we actually have to execute, so this next item
+        // must be child 0. But we are not ready to pop child 0 yet, so
+        // synthesize an unreachable instead of popping. The deeper
+        // instructions that would otherwise have been popped will remain on
+        // the stack to become prior children of future expressions or to be
+        // implicitly dropped at the end of the scope.
+        *children[i].childp = builder.builder.makeUnreachable();
+        continue;
+      }
+
+      // Pop a child normally.
+      auto val = pop(children[i].constraint.size());
+      CHECK_ERR(val);
+      *children[i].childp = *val;
+    }
+    return Ok{};
+  }
+
+  bool checkNeedsUnreachableFallback(const std::vector<Child>& children,
+                                     std::optional<size_t>& unreachableIndex) {
+    auto& scope = builder.getScope();
+
     // Two-part indices into the stack of available expressions and the vector
     // of requirements, allowing them to move independently with the granularity
     // of a single tuple element.
@@ -405,19 +389,6 @@ private:
     size_t stackTupleIndex = 0;
     size_t childIndex = children.size();
     size_t childTupleIndex = 0;
-
-    // The index of the shallowest unreachable instruction on the stack.
-    std::optional<size_t> unreachableIndex;
-
-    // Whether popping the children past the unreachable would produce a type
-    // mismatch or try to pop from an empty stack.
-    bool needUnreachableFallback = false;
-
-    if (!scope.unreachable) {
-      // We only need to check requirements if there is an unreachable.
-      // Otherwise the validator will catch any problems.
-      goto pop;
-    }
 
     // Check whether the values on the stack will be able to meet the given
     // requirements.
@@ -445,8 +416,7 @@ private:
             // the input unreachable instruction is executed first. If we are
             // not reaching past an unreachable, the error will be caught when
             // we pop.
-            needUnreachableFallback = true;
-            goto pop;
+            return true;
           }
           --stackIndex;
           stackTupleIndex = scope.exprStack[stackIndex]->type.size() - 1;
@@ -466,73 +436,17 @@ private:
       auto type = scope.exprStack[stackIndex]->type[stackTupleIndex];
       if (unreachableIndex) {
         auto constraint = children[childIndex].constraint[childTupleIndex];
-        if (constraint.isAnyType()) {
-          // Always succeeds.
-        } else if (constraint.isAnyReference()) {
-          if (!type.isRef() && type != Type::unreachable) {
-            needUnreachableFallback = true;
-            break;
-          }
-        } else if (auto bound = constraint.getSubtype()) {
-          if (!Type::isSubType(type, *bound)) {
-            needUnreachableFallback = true;
-            break;
-          }
-        } else if (constraint.isAnyI8ArrayReference()) {
-          bool isI8Array =
-            type.isRef() && type.getHeapType().isArray() &&
-            type.getHeapType().getArray().element.packedType == Field::i8;
-          bool isNone =
-            type.isRef() && type.getHeapType().isMaybeShared(HeapType::none);
-          if (!isI8Array && !isNone && type != Type::unreachable) {
-            needUnreachableFallback = true;
-            break;
-          }
-        } else if (constraint.isAnyI16ArrayReference()) {
-          bool isI16Array =
-            type.isRef() && type.getHeapType().isArray() &&
-            type.getHeapType().getArray().element.packedType == Field::i16;
-          bool isNone =
-            type.isRef() && type.getHeapType().isMaybeShared(HeapType::none);
-          if (!isI16Array && !isNone && type != Type::unreachable) {
-            needUnreachableFallback = true;
-            break;
-          }
-        } else {
-          WASM_UNREACHABLE("unexpected constraint");
+        if (!PrincipalType::matches(type, constraint)) {
+          return true;
         }
       }
 
       // No problems for children after this unreachable.
       if (type == Type::unreachable) {
-        assert(!needUnreachableFallback);
         unreachableIndex = stackIndex;
       }
     }
-
-  pop:
-    // We have checked all the constraints, so we are ready to pop children.
-    for (int i = children.size() - 1; i >= 0; --i) {
-      if (needUnreachableFallback &&
-          scope.exprStack.size() == *unreachableIndex + 1 && i > 0) {
-        // The next item on the stack is the unreachable instruction we must
-        // not pop past. We cannot insert unreachables in front of it because
-        // it might be a branch we actually have to execute, so this next item
-        // must be child 0. But we are not ready to pop child 0 yet, so
-        // synthesize an unreachable instead of popping. The deeper
-        // instructions that would otherwise have been popped will remain on
-        // the stack to become prior children of future expressions or to be
-        // implicitly dropped at the end of the scope.
-        *children[i].childp = builder.builder.makeUnreachable();
-        continue;
-      }
-
-      // Pop a child normally.
-      auto val = pop(children[i].constraint.size());
-      CHECK_ERR(val);
-      *children[i].childp = *val;
-    }
-    return Ok{};
+    return false;
   }
 
   Result<Expression*> pop(size_t size) {
@@ -658,10 +572,17 @@ public:
     return popConstrainedChildren(children);
   }
 
-  Result<> visitStringEncode(StringEncode* curr,
+  Result<> visitArrayRMW(ArrayRMW* curr,
+                         std::optional<HeapType> ht = std::nullopt) {
+    std::vector<Child> children;
+    ConstraintCollector{builder, children}.visitArrayRMW(curr, ht);
+    return popConstrainedChildren(children);
+  }
+
+  Result<> visitArrayCmpxchg(ArrayCmpxchg* curr,
                              std::optional<HeapType> ht = std::nullopt) {
     std::vector<Child> children;
-    ConstraintCollector{builder, children}.visitStringEncode(curr, ht);
+    ConstraintCollector{builder, children}.visitArrayCmpxchg(curr, ht);
     return popConstrainedChildren(children);
   }
 
@@ -669,6 +590,13 @@ public:
                         std::optional<HeapType> ht = std::nullopt) {
     std::vector<Child> children;
     ConstraintCollector{builder, children}.visitCallRef(curr, ht);
+    return popConstrainedChildren(children);
+  }
+
+  Result<> visitRefGetDesc(RefGetDesc* curr,
+                           std::optional<HeapType> ht = std::nullopt) {
+    std::vector<Child> children;
+    ConstraintCollector{builder, children}.visitRefGetDesc(curr, ht);
     return popConstrainedChildren(children);
   }
 
@@ -926,9 +854,28 @@ Result<> IRBuilder::visitElse() {
   if (binaryPos && func) {
     func->delimiterLocations[iff][BinaryLocations::Else] =
       lastBinaryPos - codeSectionOffset;
+
+    // Note the start of the if (which will be lost as the If is closed and the
+    // Else begins, but the if spans them both).
+    func->expressionLocations[iff].start = scope.startPos - codeSectionOffset;
   }
 
   return pushScope(ScopeCtx::makeElse(std::move(scope)));
+}
+
+void setCatchBody(Try* tryy, Expression* expr, Index index) {
+  // Indexes are managed manually to support Outlining.
+  // Its prepopulated try catchBodies and catchTags vectors
+  // cannot be appended to, as in the case of the empty try
+  // used during parsing.
+  if (tryy->catchBodies.size() < index) {
+    tryy->catchBodies.resize(tryy->catchBodies.size() + 1);
+  }
+  // The first time visitCatch is called: the body of the
+  // try is set and catchBodies is not appended to, but the tag
+  // for the following catch is appended. So, catchTags uses
+  // index as-is, but catchBodies uses index-1.
+  tryy->catchBodies[index - 1] = expr;
 }
 
 Result<> IRBuilder::visitCatch(Name tag) {
@@ -942,18 +889,24 @@ Result<> IRBuilder::visitCatch(Name tag) {
   if (!tryy) {
     return Err{"unexpected catch"};
   }
+  auto index = scope.getIndex();
   auto expr = finishScope();
   CHECK_ERR(expr);
   if (wasTry) {
     tryy->body = *expr;
   } else {
-    tryy->catchBodies.push_back(*expr);
+    setCatchBody(tryy, *expr, index);
   }
-  tryy->catchTags.push_back(tag);
+  if (tryy->catchTags.size() == index) {
+    tryy->catchTags.resize(tryy->catchTags.size() + 1);
+  }
+  tryy->catchTags[index] = tag;
 
   if (binaryPos && func) {
     auto& delimiterLocs = func->delimiterLocations[tryy];
     delimiterLocs[delimiterLocs.size()] = lastBinaryPos - codeSectionOffset;
+    // TODO: As in visitElse, we likely need to stash the Try start. Here we
+    //       also need to account for multiple catches.
   }
 
   CHECK_ERR(pushScope(ScopeCtx::makeCatch(std::move(scope), tryy)));
@@ -963,7 +916,7 @@ Result<> IRBuilder::visitCatch(Name tag) {
     // Note that we have a pop to help determine later whether we need to run
     // the fixup for pops within blocks.
     scopeStack[0].notePop();
-    push(builder.makePop(params));
+    pushSynthetic(builder.makePop(params));
   }
 
   return Ok{};
@@ -980,12 +933,13 @@ Result<> IRBuilder::visitCatchAll() {
   if (!tryy) {
     return Err{"unexpected catch"};
   }
+  auto index = scope.getIndex();
   auto expr = finishScope();
   CHECK_ERR(expr);
   if (wasTry) {
     tryy->body = *expr;
   } else {
-    tryy->catchBodies.push_back(*expr);
+    setCatchBody(tryy, *expr, index);
   }
 
   if (binaryPos && func) {
@@ -1123,7 +1077,8 @@ Result<> IRBuilder::visitEnd() {
     push(maybeWrapForLabel(tryy));
   } else if (Try * tryy;
              (tryy = scope.getCatch()) || (tryy = scope.getCatchAll())) {
-    tryy->catchBodies.push_back(*expr);
+    auto index = scope.getIndex();
+    setCatchBody(tryy, *expr, index);
     tryy->name = scope.label;
     tryy->finalize(tryy->type);
     push(maybeWrapForLabel(tryy));
@@ -1359,9 +1314,11 @@ Result<> IRBuilder::makeBlock(Name label, Signature sig) {
   return visitBlockStart(block, sig.params);
 }
 
-Result<> IRBuilder::makeIf(Name label, Signature sig) {
+Result<>
+IRBuilder::makeIf(Name label, Signature sig, std::optional<bool> likely) {
   auto* iff = wasm.allocator.alloc<If>();
   iff->type = sig.results;
+  addBranchHint(iff, likely);
   return visitIfStart(iff, label, sig.params);
 }
 
@@ -1372,7 +1329,9 @@ Result<> IRBuilder::makeLoop(Name label, Signature sig) {
   return visitLoopStart(loop, sig.params);
 }
 
-Result<> IRBuilder::makeBreak(Index label, bool isConditional) {
+Result<> IRBuilder::makeBreak(Index label,
+                              bool isConditional,
+                              std::optional<bool> likely) {
   auto name = getLabelName(label);
   CHECK_ERR(name);
   auto labelType = getLabelType(label);
@@ -1383,7 +1342,10 @@ Result<> IRBuilder::makeBreak(Index label, bool isConditional) {
   // Use a dummy condition value if we need to pop a condition.
   curr.condition = isConditional ? &curr : nullptr;
   CHECK_ERR(ChildPopper{*this}.visitBreak(&curr, *labelType));
-  push(builder.makeBreak(curr.name, curr.value, curr.condition));
+  auto* br = builder.makeBreak(curr.name, curr.value, curr.condition);
+  addBranchHint(br, likely);
+  push(br);
+
   return Ok{};
 }
 
@@ -1413,29 +1375,45 @@ Result<> IRBuilder::makeSwitch(const std::vector<Index>& labels,
   return Ok{};
 }
 
-Result<> IRBuilder::makeCall(Name func, bool isReturn) {
+Result<> IRBuilder::makeCall(Name func,
+                             bool isReturn,
+                             std::optional<std::uint8_t> inline_) {
   auto sig = wasm.getFunction(func)->getSig();
   Call curr(wasm.allocator);
   curr.target = func;
   curr.operands.resize(sig.params.size());
   CHECK_ERR(visitCall(&curr));
-  push(builder.makeCall(curr.target, curr.operands, sig.results, isReturn));
+  auto* call =
+    builder.makeCall(curr.target, curr.operands, sig.results, isReturn);
+  push(call);
+  addInlineHint(call, inline_);
   return Ok{};
 }
 
-Result<> IRBuilder::makeCallIndirect(Name table, HeapType type, bool isReturn) {
+Result<> IRBuilder::makeCallIndirect(Name table,
+                                     HeapType type,
+                                     bool isReturn,
+                                     std::optional<std::uint8_t> inline_) {
+  if (!type.isSignature()) {
+    return Err{"expected function type annotation on call_indirect"};
+  }
   CallIndirect curr(wasm.allocator);
   curr.heapType = type;
   curr.operands.resize(type.getSignature().params.size());
   CHECK_ERR(visitCallIndirect(&curr));
-  push(builder.makeCallIndirect(
-    table, curr.target, curr.operands, type, isReturn));
+  auto* call =
+    builder.makeCallIndirect(table, curr.target, curr.operands, type, isReturn);
+  push(call);
+  addInlineHint(call, inline_);
   return Ok{};
 }
 
 Result<> IRBuilder::makeLocalGet(Index local) {
   if (!func) {
     return Err{"local.get is only valid in a function context"};
+  }
+  if (local >= func->getNumLocals()) {
+    return Err{"invalid local.get index"};
   }
   push(builder.makeLocalGet(local, func->getLocalType(local)));
   return Ok{};
@@ -1444,6 +1422,9 @@ Result<> IRBuilder::makeLocalGet(Index local) {
 Result<> IRBuilder::makeLocalSet(Index local) {
   if (!func) {
     return Err{"local.set is only valid in a function context"};
+  }
+  if (local >= func->getNumLocals()) {
+    return Err{"invalid local.set index"};
   }
   LocalSet curr;
   curr.index = local;
@@ -1455,6 +1436,9 @@ Result<> IRBuilder::makeLocalSet(Index local) {
 Result<> IRBuilder::makeLocalTee(Index local) {
   if (!func) {
     return Err{"local.tee is only valid in a function context"};
+  }
+  if (local >= func->getNumLocals()) {
+    return Err{"invalid local.tee index"};
   }
   LocalSet curr;
   curr.index = local;
@@ -1564,6 +1548,11 @@ Result<> IRBuilder::makeAtomicNotify(Address offset, Name mem) {
 
 Result<> IRBuilder::makeAtomicFence() {
   push(builder.makeAtomicFence());
+  return Ok{};
+}
+
+Result<> IRBuilder::makePause() {
+  push(builder.makePause());
   return Ok{};
 }
 
@@ -1756,7 +1745,7 @@ Result<> IRBuilder::makeRefIsNull() {
 }
 
 Result<> IRBuilder::makeRefFunc(Name func) {
-  push(builder.makeRefFunc(func, wasm.getFunction(func)->type));
+  push(builder.makeRefFunc(func));
   return Ok{};
 }
 
@@ -1820,6 +1809,11 @@ Result<> IRBuilder::makeTableInit(Name elem, Name table) {
   curr.table = table;
   CHECK_ERR(visitTableInit(&curr));
   push(builder.makeTableInit(elem, curr.dest, curr.offset, curr.size, table));
+  return Ok{};
+}
+
+Result<> IRBuilder::makeElemDrop(Name segment) {
+  push(builder.makeElemDrop(segment));
   return Ok{};
 }
 
@@ -1919,7 +1913,12 @@ Result<> IRBuilder::makeI31Get(bool signed_) {
   return Ok{};
 }
 
-Result<> IRBuilder::makeCallRef(HeapType type, bool isReturn) {
+Result<> IRBuilder::makeCallRef(HeapType type,
+                                bool isReturn,
+                                std::optional<std::uint8_t> inline_) {
+  if (!type.isSignature()) {
+    return Err{"expected function type annotation on call_ref"};
+  }
   CallRef curr(wasm.allocator);
   if (!type.isSignature()) {
     return Err{"expected function type"};
@@ -1928,7 +1927,10 @@ Result<> IRBuilder::makeCallRef(HeapType type, bool isReturn) {
   curr.operands.resize(type.getSignature().params.size());
   CHECK_ERR(ChildPopper{*this}.visitCallRef(&curr, type));
   CHECK_ERR(validateTypeAnnotation(type, curr.target));
-  push(builder.makeCallRef(curr.target, curr.operands, sig.results, isReturn));
+  auto* call =
+    builder.makeCallRef(curr.target, curr.operands, sig.results, isReturn);
+  push(call);
+  addInlineHint(call, inline_);
   return Ok{};
 }
 
@@ -1940,26 +1942,74 @@ Result<> IRBuilder::makeRefTest(Type type) {
   return Ok{};
 }
 
-Result<> IRBuilder::makeRefCast(Type type) {
+Result<> IRBuilder::makeRefCast(Type type, bool isDesc) {
+  std::optional<HeapType> descriptor;
+  if (isDesc) {
+    assert(type.isRef());
+    descriptor = type.getHeapType().getDescriptorType();
+    if (!descriptor) {
+      return Err{"cast target must have descriptor"};
+    }
+  }
+
   RefCast curr;
   curr.type = type;
+  // Placeholder value to differentiate ref.cast_desc.
+  curr.desc = isDesc ? &curr : nullptr;
   CHECK_ERR(visitRefCast(&curr));
-  push(builder.makeRefCast(curr.ref, type));
+
+  if (isDesc) {
+    CHECK_ERR(
+      validateTypeAnnotation(type.with(*descriptor).with(Nullable), curr.desc));
+  }
+
+  push(builder.makeRefCast(curr.ref, curr.desc, type));
   return Ok{};
 }
 
-Result<> IRBuilder::makeBrOn(Index label, BrOnOp op, Type in, Type out) {
+Result<> IRBuilder::makeRefGetDesc(HeapType type) {
+  RefGetDesc curr;
+  if (!type.getDescriptorType()) {
+    return Err{"expected type with descriptor"};
+  }
+  CHECK_ERR(ChildPopper{*this}.visitRefGetDesc(&curr, type));
+  CHECK_ERR(validateTypeAnnotation(type, curr.ref));
+  push(builder.makeRefGetDesc(curr.ref));
+  return Ok{};
+}
+
+Result<> IRBuilder::makeBrOn(
+  Index label, BrOnOp op, Type in, Type out, std::optional<bool> likely) {
+  std::optional<HeapType> descriptor;
+  if (op == BrOnCastDesc || op == BrOnCastDescFail) {
+    assert(out.isRef());
+    descriptor = out.getHeapType().getDescriptorType();
+    if (!descriptor) {
+      return Err{"cast target must have descriptor"};
+    }
+  }
+
   BrOn curr;
   curr.op = op;
   curr.castType = out;
+  curr.desc = nullptr;
   CHECK_ERR(visitBrOn(&curr));
-  if (out != Type::none) {
-    if (!Type::isSubType(out, in)) {
-      return Err{"output type is not a subtype of the input type"};
+
+  // Validate type immediates before we forget them.
+  switch (op) {
+    case BrOnNull:
+    case BrOnNonNull:
+      break;
+    case BrOnCastDesc:
+    case BrOnCastDescFail: {
+      CHECK_ERR(validateTypeAnnotation(out.with(*descriptor).with(Nullable),
+                                       curr.desc));
     }
-    if (!Type::isSubType(curr.ref->type, in)) {
-      return Err{"expected input to match input type annotation"};
-    }
+      [[fallthrough]];
+    case BrOnCast:
+    case BrOnCastFail:
+      assert(in.isRef());
+      CHECK_ERR(validateTypeAnnotation(in, curr.ref));
   }
 
   // Extra values need to be sent in a scratch local.
@@ -1973,6 +2023,8 @@ Result<> IRBuilder::makeBrOn(Index label, BrOnOp op, Type in, Type out) {
     case BrOnNonNull:
     case BrOnCast:
     case BrOnCastFail:
+    case BrOnCastDesc:
+    case BrOnCastDescFail:
       // Modeled as sending one value.
       if (extraArity == 0) {
         return Err{"br_on target does not expect a value"};
@@ -1992,6 +2044,8 @@ Result<> IRBuilder::makeBrOn(Index label, BrOnOp op, Type in, Type out) {
       break;
     case BrOnCast:
     case BrOnCastFail:
+    case BrOnCastDesc:
+    case BrOnCastDescFail:
       testType = in;
       break;
   }
@@ -2005,7 +2059,9 @@ Result<> IRBuilder::makeBrOn(Index label, BrOnOp op, Type in, Type out) {
     auto name = getLabelName(label);
     CHECK_ERR(name);
 
-    push(builder.makeBrOn(op, *name, curr.ref, out));
+    auto* br = builder.makeBrOn(op, *name, curr.ref, out, curr.desc);
+    addBranchHint(br, likely);
+    push(br);
     return Ok{};
   }
 
@@ -2027,7 +2083,9 @@ Result<> IRBuilder::makeBrOn(Index label, BrOnOp op, Type in, Type out) {
 
   // Perform the branch.
   CHECK_ERR(visitBrOn(&curr));
-  push(builder.makeBrOn(op, extraLabel, curr.ref, out));
+  auto* br = builder.makeBrOn(op, extraLabel, curr.ref, out, curr.desc);
+  addBranchHint(br, likely);
+  push(br);
 
   // If the branch wasn't taken, we need to leave the extra values on the
   // stack. For all instructions except br_on_non_null the extra values need
@@ -2046,6 +2104,7 @@ Result<> IRBuilder::makeBrOn(Index label, BrOnOp op, Type in, Type out) {
     case BrOnNonNull:
       WASM_UNREACHABLE("unexpected op");
     case BrOnCast:
+    case BrOnCastDesc:
       if (out.isNullable()) {
         resultType = Type(in.getHeapType(), NonNullable);
       } else {
@@ -2053,6 +2112,7 @@ Result<> IRBuilder::makeBrOn(Index label, BrOnOp op, Type in, Type out) {
       }
       break;
     case BrOnCastFail:
+    case BrOnCastDescFail:
       if (in.isNonNullable()) {
         resultType = Type(out.getHeapType(), NonNullable);
       } else {
@@ -2070,18 +2130,37 @@ Result<> IRBuilder::makeBrOn(Index label, BrOnOp op, Type in, Type out) {
   return Ok{};
 }
 
-Result<> IRBuilder::makeStructNew(HeapType type) {
+Result<> IRBuilder::makeStructNew(HeapType type, bool isDesc) {
+  if (!type.isStruct()) {
+    return Err{"expected struct type annotation on struct.new"};
+  }
+  if (isDesc && !type.getDescriptorType()) {
+    return Err{"struct.new_desc of type without descriptor"};
+  }
+  // TODO: Uncomment this after a transition period.
+  // if (!isDesc && type.getDescriptorType()) {
+  //   return Err{"type with descriptor requires struct.new_desc"};
+  // }
   StructNew curr(wasm.allocator);
-  curr.type = Type(type, NonNullable);
-  // Differentiate from struct.new_default with a non-empty expression list.
+  curr.type = Type(type, NonNullable, Exact);
   curr.operands.resize(type.getStruct().fields.size());
   CHECK_ERR(visitStructNew(&curr));
-  push(builder.makeStructNew(type, std::move(curr.operands)));
+  push(builder.makeStructNew(type, std::move(curr.operands), curr.desc));
   return Ok{};
 }
 
-Result<> IRBuilder::makeStructNewDefault(HeapType type) {
-  push(builder.makeStructNew(type, {}));
+Result<> IRBuilder::makeStructNewDefault(HeapType type, bool isDesc) {
+  if (isDesc && !type.getDescriptorType()) {
+    return Err{"struct.new_default_desc of type without descriptor"};
+  }
+  // TODO: Uncomment this after a transition period.
+  // if (!isDesc && type.getDescriptorType()) {
+  //   return Err{"type with descriptor requires struct.new_default_desc"};
+  // }
+  StructNew curr(wasm.allocator);
+  curr.type = Type(type, NonNullable, Exact);
+  CHECK_ERR(visitStructNew(&curr));
+  push(builder.makeStructNew(type, {}, curr.desc));
   return Ok{};
 }
 
@@ -2100,6 +2179,9 @@ Result<> IRBuilder::makeStructGet(HeapType type,
 
 Result<>
 IRBuilder::makeStructSet(HeapType type, Index field, MemoryOrder order) {
+  if (!type.isStruct()) {
+    return Err{"expected struct type annotation on struct.set"};
+  }
   StructSet curr;
   curr.index = field;
   CHECK_ERR(ChildPopper{*this}.visitStructSet(&curr, type));
@@ -2112,6 +2194,9 @@ Result<> IRBuilder::makeStructRMW(AtomicRMWOp op,
                                   HeapType type,
                                   Index field,
                                   MemoryOrder order) {
+  if (!type.isStruct()) {
+    return Err{"expected struct type annotation on struct.atomic.rmw"};
+  }
   StructRMW curr;
   curr.index = field;
   CHECK_ERR(ChildPopper{*this}.visitStructRMW(&curr, type));
@@ -2122,6 +2207,9 @@ Result<> IRBuilder::makeStructRMW(AtomicRMWOp op,
 
 Result<>
 IRBuilder::makeStructCmpxchg(HeapType type, Index field, MemoryOrder order) {
+  if (!type.isStruct()) {
+    return Err{"expected struct type annotation on struct.atomic.rmw"};
+  }
   StructCmpxchg curr;
   curr.index = field;
   CHECK_ERR(ChildPopper{*this}.visitStructCmpxchg(&curr, type));
@@ -2132,8 +2220,11 @@ IRBuilder::makeStructCmpxchg(HeapType type, Index field, MemoryOrder order) {
 }
 
 Result<> IRBuilder::makeArrayNew(HeapType type) {
+  if (!type.isArray()) {
+    return Err{"expected array type annotation on array.new"};
+  }
   ArrayNew curr;
-  curr.type = Type(type, NonNullable);
+  curr.type = Type(type, NonNullable, Exact);
   // Differentiate from array.new_default with dummy initializer.
   curr.init = (Expression*)0x01;
   CHECK_ERR(visitArrayNew(&curr));
@@ -2164,6 +2255,9 @@ Result<> IRBuilder::makeArrayNewElem(HeapType type, Name elem) {
 }
 
 Result<> IRBuilder::makeArrayNewFixed(HeapType type, uint32_t arity) {
+  if (!type.isArray()) {
+    return Err{"expected array type annotation on array.new_fixed"};
+  }
   ArrayNewFixed curr(wasm.allocator);
   curr.type = Type(type, NonNullable);
   curr.values.resize(arity);
@@ -2172,20 +2266,24 @@ Result<> IRBuilder::makeArrayNewFixed(HeapType type, uint32_t arity) {
   return Ok{};
 }
 
-Result<> IRBuilder::makeArrayGet(HeapType type, bool signed_) {
+Result<>
+IRBuilder::makeArrayGet(HeapType type, bool signed_, MemoryOrder order) {
   ArrayGet curr;
   CHECK_ERR(ChildPopper{*this}.visitArrayGet(&curr, type));
   CHECK_ERR(validateTypeAnnotation(type, curr.ref));
   push(builder.makeArrayGet(
-    curr.ref, curr.index, type.getArray().element.type, signed_));
+    curr.ref, curr.index, order, type.getArray().element.type, signed_));
   return Ok{};
 }
 
-Result<> IRBuilder::makeArraySet(HeapType type) {
+Result<> IRBuilder::makeArraySet(HeapType type, MemoryOrder order) {
+  if (!type.isArray()) {
+    return Err{"expected array type annotation on array.set"};
+  }
   ArraySet curr;
   CHECK_ERR(ChildPopper{*this}.visitArraySet(&curr, type));
   CHECK_ERR(validateTypeAnnotation(type, curr.ref));
-  push(builder.makeArraySet(curr.ref, curr.index, curr.value));
+  push(builder.makeArraySet(curr.ref, curr.index, curr.value, order));
   return Ok{};
 }
 
@@ -2207,6 +2305,9 @@ Result<> IRBuilder::makeArrayCopy(HeapType destType, HeapType srcType) {
 }
 
 Result<> IRBuilder::makeArrayFill(HeapType type) {
+  if (!type.isArray()) {
+    return Err{"expected array type annotation on array.fill"};
+  }
   ArrayFill curr;
   CHECK_ERR(ChildPopper{*this}.visitArrayFill(&curr, type));
   CHECK_ERR(validateTypeAnnotation(type, curr.ref));
@@ -2239,6 +2340,30 @@ Result<> IRBuilder::makeArrayInitElem(HeapType type, Name elem) {
   CHECK_ERR(validateTypeAnnotation(type, curr.ref));
   push(builder.makeArrayInitElem(
     elem, curr.ref, curr.index, curr.offset, curr.size));
+  return Ok{};
+}
+
+Result<>
+IRBuilder::makeArrayRMW(AtomicRMWOp op, HeapType type, MemoryOrder order) {
+  if (!type.isArray()) {
+    return Err{"expected array type annotation on array.atomic.rmw"};
+  }
+  ArrayRMW curr;
+  CHECK_ERR(ChildPopper{*this}.visitArrayRMW(&curr, type));
+  CHECK_ERR(validateTypeAnnotation(type, curr.ref));
+  push(builder.makeArrayRMW(op, curr.ref, curr.index, curr.value, order));
+  return Ok{};
+}
+
+Result<> IRBuilder::makeArrayCmpxchg(HeapType type, MemoryOrder order) {
+  if (!type.isArray()) {
+    return Err{"expected array type annotation on array.atomic.rmw"};
+  }
+  ArrayCmpxchg curr;
+  CHECK_ERR(ChildPopper{*this}.visitArrayCmpxchg(&curr, type));
+  CHECK_ERR(validateTypeAnnotation(type, curr.ref));
+  push(builder.makeArrayCmpxchg(
+    curr.ref, curr.index, curr.expected, curr.replacement, order));
   return Ok{};
 }
 
@@ -2279,11 +2404,7 @@ Result<> IRBuilder::makeStringMeasure(StringMeasureOp op) {
 Result<> IRBuilder::makeStringEncode(StringEncodeOp op) {
   StringEncode curr;
   curr.op = op;
-  // There's no type annotation on these instructions due to a bug in the
-  // stringref proposal, so we just fudge it and pass `array` instead of a
-  // defined heap type. This will allow us to pop a child with an invalid
-  // array type, but that's just too bad.
-  CHECK_ERR(ChildPopper{*this}.visitStringEncode(&curr, HeapType::array));
+  CHECK_ERR(visitStringEncode(&curr));
   push(builder.makeStringEncode(op, curr.str, curr.array, curr.start));
   return Ok{};
 }
@@ -2299,6 +2420,13 @@ Result<> IRBuilder::makeStringEq(StringEqOp op) {
   StringEq curr;
   CHECK_ERR(visitStringEq(&curr));
   push(builder.makeStringEq(op, curr.left, curr.right));
+  return Ok{};
+}
+
+Result<> IRBuilder::makeStringTest() {
+  StringTest curr;
+  CHECK_ERR(visitStringTest(&curr));
+  push(builder.makeStringTest(curr.ref));
   return Ok{};
 }
 
@@ -2330,7 +2458,7 @@ Result<> IRBuilder::makeContNew(HeapType type) {
 
 Result<> IRBuilder::makeContBind(HeapType sourceType, HeapType targetType) {
   if (!sourceType.isContinuation() || !targetType.isContinuation()) {
-    return Err{"expected continuation types"};
+    return Err{"expected continuation type annotations on cont.bind"};
   }
   ContBind curr(wasm.allocator);
 
@@ -2420,7 +2548,7 @@ IRBuilder::makeResume(HeapType ct,
     return Err{"the sizes of tags and labels must be equal"};
   }
   if (!ct.isContinuation()) {
-    return Err{"expected continuation type"};
+    return Err{"expected continuation type annotation on resume"};
   }
 
   Resume curr(wasm.allocator);
@@ -2453,12 +2581,18 @@ IRBuilder::makeResumeThrow(HeapType ct,
     return Err{"the sizes of tags and labels must be equal"};
   }
   if (!ct.isContinuation()) {
-    return Err{"expected continuation type"};
+    return Err{"expected continuation type annotation on resume_throw"};
   }
 
   ResumeThrow curr(wasm.allocator);
   curr.tag = tag;
-  curr.operands.resize(wasm.getTag(tag)->params().size());
+  if (tag) {
+    // This is a normal resume_throw.
+    curr.operands.resize(wasm.getTag(tag)->params().size());
+  } else {
+    // This is a resume_throw_ref.
+    curr.operands.resize(1);
+  }
 
   Result<ResumeTable> resumetable = makeResumeTable(
     labels,
@@ -2479,7 +2613,7 @@ IRBuilder::makeResumeThrow(HeapType ct,
 
 Result<> IRBuilder::makeStackSwitch(HeapType ct, Name tag) {
   if (!ct.isContinuation()) {
-    return Err{"expected continuation type"};
+    return Err{"expected continuation type annotation on switch"};
   }
   StackSwitch curr(wasm.allocator);
   curr.tag = tag;
@@ -2498,6 +2632,23 @@ Result<> IRBuilder::makeStackSwitch(HeapType ct, Name tag) {
 
   push(builder.makeStackSwitch(tag, std::move(curr.operands), curr.cont));
   return Ok{};
+}
+
+void IRBuilder::addBranchHint(Expression* expr, std::optional<bool> likely) {
+  if (likely) {
+    // Branches are only possible inside functions.
+    assert(func);
+    func->codeAnnotations[expr].branchLikely = likely;
+  }
+}
+
+void IRBuilder::addInlineHint(Expression* expr,
+                              std::optional<uint8_t> inline_) {
+  if (inline_) {
+    // Branches are only possible inside functions.
+    assert(func);
+    func->codeAnnotations[expr].inline_ = inline_;
+  }
 }
 
 } // namespace wasm

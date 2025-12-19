@@ -142,6 +142,8 @@ Result<> makeAtomicNotify(Ctx&, Index, const std::vector<Annotation>&);
 template<typename Ctx>
 Result<> makeAtomicFence(Ctx&, Index, const std::vector<Annotation>&);
 template<typename Ctx>
+Result<> makePause(Ctx&, Index, const std::vector<Annotation>&);
+template<typename Ctx>
 Result<> makeSIMDExtract(
   Ctx&, Index, const std::vector<Annotation>&, SIMDExtractOp op, size_t lanes);
 template<typename Ctx>
@@ -209,6 +211,8 @@ Result<> makeTableCopy(Ctx&, Index, const std::vector<Annotation>&);
 template<typename Ctx>
 Result<> makeTableInit(Ctx&, Index, const std::vector<Annotation>&);
 template<typename Ctx>
+Result<> makeElemDrop(Ctx&, Index, const std::vector<Annotation>&);
+template<typename Ctx>
 Result<> makeThrow(Ctx&, Index, const std::vector<Annotation>&);
 template<typename Ctx>
 Result<> makeRethrow(Ctx&, Index, const std::vector<Annotation>&);
@@ -231,16 +235,17 @@ Result<> makeI31Get(Ctx&, Index, const std::vector<Annotation>&, bool signed_);
 template<typename Ctx>
 Result<> makeRefTest(Ctx&, Index, const std::vector<Annotation>&);
 template<typename Ctx>
-Result<> makeRefCast(Ctx&, Index, const std::vector<Annotation>&);
+Result<> makeRefCast(Ctx&, Index, const std::vector<Annotation>&, bool isDesc);
+template<typename Ctx>
+Result<> makeRefGetDesc(Ctx&, Index, const std::vector<Annotation>&);
 template<typename Ctx>
 Result<>
 makeBrOnNull(Ctx&, Index, const std::vector<Annotation>&, bool onFail = false);
 template<typename Ctx>
-Result<>
-makeBrOnCast(Ctx&, Index, const std::vector<Annotation>&, bool onFail = false);
+Result<> makeBrOnCast(Ctx&, Index, const std::vector<Annotation>&, BrOnOp op);
 template<typename Ctx>
-Result<>
-makeStructNew(Ctx&, Index, const std::vector<Annotation>&, bool default_);
+Result<> makeStructNew(
+  Ctx&, Index, const std::vector<Annotation>&, bool default_, bool isDesc);
 template<typename Ctx>
 Result<> makeStructGet(Ctx&,
                        Index,
@@ -272,7 +277,14 @@ template<typename Ctx>
 Result<>
 makeArrayGet(Ctx&, Index, const std::vector<Annotation>&, bool signed_ = false);
 template<typename Ctx>
+Result<> makeAtomicArrayGet(Ctx&,
+                            Index,
+                            const std::vector<Annotation>&,
+                            bool signed_ = false);
+template<typename Ctx>
 Result<> makeArraySet(Ctx&, Index, const std::vector<Annotation>&);
+template<typename Ctx>
+Result<> makeAtomicArraySet(Ctx&, Index, const std::vector<Annotation>&);
 template<typename Ctx>
 Result<> makeArrayLen(Ctx&, Index, const std::vector<Annotation>&);
 template<typename Ctx>
@@ -283,6 +295,10 @@ template<typename Ctx>
 Result<> makeArrayInitData(Ctx&, Index, const std::vector<Annotation>&);
 template<typename Ctx>
 Result<> makeArrayInitElem(Ctx&, Index, const std::vector<Annotation>&);
+template<typename Ctx>
+Result<> makeArrayRMW(AtomicRMWOp, Index, const std::vector<Annotation>&);
+template<typename Ctx>
+Result<> makeArrayCmpxchg(Index, const std::vector<Annotation>&);
 template<typename Ctx>
 Result<> makeRefAs(Ctx&, Index, const std::vector<Annotation>&, RefAsOp op);
 template<typename Ctx>
@@ -304,6 +320,8 @@ template<typename Ctx>
 Result<> makeStringConcat(Ctx&, Index, const std::vector<Annotation>&);
 template<typename Ctx>
 Result<> makeStringEq(Ctx&, Index, const std::vector<Annotation>&, StringEqOp);
+template<typename Ctx>
+Result<> makeStringTest(Ctx&, Index, const std::vector<Annotation>&);
 template<typename Ctx>
 Result<> makeStringWTF16Get(Ctx&, Index, const std::vector<Annotation>&);
 template<typename Ctx>
@@ -352,6 +370,8 @@ Result<typename Ctx::LabelIdxT> labelidx(Ctx&, bool inDelegate = false);
 template<typename Ctx> Result<typename Ctx::TagIdxT> tagidx(Ctx&);
 template<typename Ctx>
 Result<typename Ctx::TypeUseT> typeuse(Ctx&, bool allowNames = true);
+template<typename Ctx>
+Result<std::pair<typename Ctx::TypeUse, Exactness>> exacttypeuse(Ctx&);
 MaybeResult<ImportNames> inlineImport(Lexer&);
 Result<std::vector<Name>> inlineExports(Lexer&);
 template<typename Ctx> Result<> comptype(Ctx&);
@@ -1800,6 +1820,12 @@ Result<> makeAtomicFence(Ctx& ctx,
 }
 
 template<typename Ctx>
+Result<>
+makePause(Ctx& ctx, Index pos, const std::vector<Annotation>& annotations) {
+  return ctx.makePause(pos, annotations);
+}
+
+template<typename Ctx>
 Result<> makeSIMDExtract(Ctx& ctx,
                          Index pos,
                          const std::vector<Annotation>& annotations,
@@ -2118,11 +2144,42 @@ makeTableCopy(Ctx& ctx, Index pos, const std::vector<Annotation>& annotations) {
 template<typename Ctx>
 Result<>
 makeTableInit(Ctx& ctx, Index pos, const std::vector<Annotation>& annotations) {
+  // Note: binary and text formats for `table.init` are different. In both
+  // formats the table index is optional (with 0 as the default). When both the
+  // table and elem index are specified, the elem index comes first in the
+  // binary format, but second in the text format.
+
+  auto reset = ctx.in.getPos();
+
+  auto retry = [&]() -> Result<> {
+    // We're unable to parse the two argument format. Try one argument format
+    // with just elem index.
+    WithPosition with(ctx, reset);
+    auto elem = elemidx(ctx);
+    CHECK_ERR(elem);
+    MaybeResult<typename Ctx::TableIdxT> table = ctx.getTableFromIdx(0);
+    return ctx.makeTableInit(pos, annotations, table.getPtr(), *elem);
+  };
+
   auto table = maybeTableidx(ctx);
-  CHECK_ERR(table);
+  if (table.getErr()) {
+    return retry();
+  }
+
+  auto elem = maybeElemidx(ctx);
+  if (elem.getErr() || !elem) {
+    return retry();
+  }
+
+  return ctx.makeTableInit(pos, annotations, table.getPtr(), *elem);
+}
+
+template<typename Ctx>
+Result<>
+makeElemDrop(Ctx& ctx, Index pos, const std::vector<Annotation>& annotations) {
   auto elem = elemidx(ctx);
   CHECK_ERR(elem);
-  return ctx.makeTableInit(pos, annotations, table.getPtr(), *elem);
+  return ctx.makeElemDrop(pos, annotations, *elem);
 }
 
 template<typename Ctx>
@@ -2211,11 +2268,22 @@ makeRefTest(Ctx& ctx, Index pos, const std::vector<Annotation>& annotations) {
 }
 
 template<typename Ctx>
-Result<>
-makeRefCast(Ctx& ctx, Index pos, const std::vector<Annotation>& annotations) {
+Result<> makeRefCast(Ctx& ctx,
+                     Index pos,
+                     const std::vector<Annotation>& annotations,
+                     bool isDesc) {
   auto type = reftype(ctx);
   CHECK_ERR(type);
-  return ctx.makeRefCast(pos, annotations, *type);
+  return ctx.makeRefCast(pos, annotations, *type, isDesc);
+}
+
+template<typename Ctx>
+Result<> makeRefGetDesc(Ctx& ctx,
+                        Index pos,
+                        const std::vector<Annotation>& annotations) {
+  auto type = typeidx(ctx);
+  CHECK_ERR(type);
+  return ctx.makeRefGetDesc(pos, annotations, *type);
 }
 
 template<typename Ctx>
@@ -2233,28 +2301,28 @@ template<typename Ctx>
 Result<> makeBrOnCast(Ctx& ctx,
                       Index pos,
                       const std::vector<Annotation>& annotations,
-                      bool onFail) {
+                      BrOnOp op) {
   auto label = labelidx(ctx);
   CHECK_ERR(label);
   auto in = reftype(ctx);
   CHECK_ERR(in);
   auto out = reftype(ctx);
   CHECK_ERR(out);
-  return ctx.makeBrOn(
-    pos, annotations, *label, onFail ? BrOnCastFail : BrOnCast, *in, *out);
+  return ctx.makeBrOn(pos, annotations, *label, op, *in, *out);
 }
 
 template<typename Ctx>
 Result<> makeStructNew(Ctx& ctx,
                        Index pos,
                        const std::vector<Annotation>& annotations,
-                       bool default_) {
+                       bool default_,
+                       bool isDesc) {
   auto type = typeidx(ctx);
   CHECK_ERR(type);
   if (default_) {
-    return ctx.makeStructNewDefault(pos, annotations, *type);
+    return ctx.makeStructNewDefault(pos, annotations, *type, isDesc);
   }
-  return ctx.makeStructNew(pos, annotations, *type);
+  return ctx.makeStructNew(pos, annotations, *type, isDesc);
 }
 
 template<typename Ctx>
@@ -2400,7 +2468,20 @@ Result<> makeArrayGet(Ctx& ctx,
                       bool signed_) {
   auto type = typeidx(ctx);
   CHECK_ERR(type);
-  return ctx.makeArrayGet(pos, annotations, *type, signed_);
+  return ctx.makeArrayGet(
+    pos, annotations, *type, signed_, MemoryOrder::Unordered);
+}
+
+template<typename Ctx>
+Result<> makeAtomicArrayGet(Ctx& ctx,
+                            Index pos,
+                            const std::vector<Annotation>& annotations,
+                            bool signed_) {
+  auto order = memorder(ctx);
+  CHECK_ERR(order);
+  auto type = typeidx(ctx);
+  CHECK_ERR(type);
+  return ctx.makeArrayGet(pos, annotations, *type, signed_, *order);
 }
 
 template<typename Ctx>
@@ -2408,7 +2489,18 @@ Result<>
 makeArraySet(Ctx& ctx, Index pos, const std::vector<Annotation>& annotations) {
   auto type = typeidx(ctx);
   CHECK_ERR(type);
-  return ctx.makeArraySet(pos, annotations, *type);
+  return ctx.makeArraySet(pos, annotations, *type, MemoryOrder::Unordered);
+}
+
+template<typename Ctx>
+Result<> makeAtomicArraySet(Ctx& ctx,
+                            Index pos,
+                            const std::vector<Annotation>& annotations) {
+  auto order = memorder(ctx);
+  CHECK_ERR(order);
+  auto type = typeidx(ctx);
+  CHECK_ERR(type);
+  return ctx.makeArraySet(pos, annotations, *type, *order);
 }
 
 template<typename Ctx>
@@ -2455,6 +2547,39 @@ Result<> makeArrayInitElem(Ctx& ctx,
   auto elem = elemidx(ctx);
   CHECK_ERR(elem);
   return ctx.makeArrayInitElem(pos, annotations, *type, *elem);
+}
+
+template<typename Ctx>
+Result<> makeArrayRMW(Ctx& ctx,
+                      Index pos,
+                      const std::vector<Annotation>& annotations,
+                      AtomicRMWOp op) {
+  auto order1 = memorder(ctx);
+  CHECK_ERR(order1);
+  auto order2 = memorder(ctx);
+  CHECK_ERR(order2);
+  if (*order1 != *order2) {
+    return ctx.in.err(pos, "array.atomic.rmw memory orders must be identical");
+  }
+  auto type = typeidx(ctx);
+  CHECK_ERR(type);
+  return ctx.makeArrayRMW(pos, annotations, op, *type, *order1);
+}
+
+template<typename Ctx>
+Result<> makeArrayCmpxchg(Ctx& ctx,
+                          Index pos,
+                          const std::vector<Annotation>& annotations) {
+  auto order1 = memorder(ctx);
+  CHECK_ERR(order1);
+  auto order2 = memorder(ctx);
+  CHECK_ERR(order2);
+  if (*order1 != *order2) {
+    return ctx.in.err(pos, "array.atomic.rmw memory orders must be identical");
+  }
+  auto type = typeidx(ctx);
+  CHECK_ERR(type);
+  return ctx.makeArrayCmpxchg(pos, annotations, *type, *order1);
 }
 
 template<typename Ctx>
@@ -2513,6 +2638,13 @@ Result<> makeStringEq(Ctx& ctx,
                       const std::vector<Annotation>& annotations,
                       StringEqOp op) {
   return ctx.makeStringEq(pos, annotations, op);
+}
+
+template<typename Ctx>
+Result<> makeStringTest(Ctx& ctx,
+                        Index pos,
+                        const std::vector<Annotation>& annotations) {
+  return ctx.makeStringTest(pos, annotations);
 }
 
 template<typename Ctx>
@@ -2609,6 +2741,21 @@ Result<> makeResumeThrow(Ctx& ctx,
   CHECK_ERR(resumetable);
 
   return ctx.makeResumeThrow(pos, annotations, *type, *exnTag, *resumetable);
+}
+
+// resume_throw_ref ::= 'resume_throw' typeidx ('(' 'on' tagidx labelidx |
+// 'on' tagidx switch ')')*
+template<typename Ctx>
+Result<> makeResumeThrowRef(Ctx& ctx,
+                            Index pos,
+                            const std::vector<Annotation>& annotations) {
+  auto type = typeidx(ctx);
+  CHECK_ERR(type);
+
+  auto resumetable = makeResumeTable(ctx);
+  CHECK_ERR(resumetable);
+
+  return ctx.makeResumeThrowRef(pos, annotations, *type, *resumetable);
 }
 
 // switch ::= 'switch' typeidx tagidx
@@ -2771,12 +2918,21 @@ template<typename Ctx> Result<typename Ctx::GlobalIdxT> globalidx(Ctx& ctx) {
 
 // elemidx ::= x:u32 => x
 //           | v:id => x (if elems[x] = v)
-template<typename Ctx> Result<typename Ctx::ElemIdxT> elemidx(Ctx& ctx) {
+template<typename Ctx>
+MaybeResult<typename Ctx::ElemIdxT> maybeElemidx(Ctx& ctx) {
   if (auto x = ctx.in.takeU32()) {
     return ctx.getElemFromIdx(*x);
   }
   if (auto id = ctx.in.takeID()) {
     return ctx.getElemFromName(*id);
+  }
+  return {};
+}
+
+template<typename Ctx> Result<typename Ctx::ElemIdxT> elemidx(Ctx& ctx) {
+  if (auto idx = maybeElemidx(ctx)) {
+    CHECK_ERR(idx);
+    return *idx;
   }
   return ctx.in.err("expected elem index or identifier");
 }
@@ -2869,6 +3025,24 @@ Result<typename Ctx::TypeUseT> typeuse(Ctx& ctx, bool allowNames) {
   return ctx.makeTypeUse(pos, type, namedParams.getPtr(), resultTypes.getPtr());
 }
 
+// exacttypeuse ::= typeuse |
+//                  '(' 'exact' typeuse ')'
+template<typename Ctx>
+Result<std::pair<typename Ctx::TypeUseT, Exactness>> exacttypeuse(Ctx& ctx) {
+  auto exact = Inexact;
+  if (ctx.in.takeSExprStart("exact"sv)) {
+    exact = Exact;
+  }
+  auto type = typeuse(ctx, true);
+  CHECK_ERR(type);
+  if (exact == Exact) {
+    if (!ctx.in.takeRParen()) {
+      return ctx.in.err("expected end of exact type use");
+    }
+  }
+  return std::make_pair(*type, exact);
+}
+
 // ('(' 'import' mod:name nm:name ')')?
 inline MaybeResult<ImportNames> inlineImport(Lexer& in) {
   if (!in.takeSExprStart("import"sv)) {
@@ -2933,34 +3107,30 @@ template<typename Ctx> Result<> comptype(Ctx& ctx) {
   return ctx.in.err("expected type description");
 }
 
-// describedcomptype ::= '(' 'descriptor' typeidx ct:comptype ')'
-//                     | ct:comptype
+// describedcomptype ::= '(' 'descriptor' typeidx ')' comptype
+//                     | comptype
 template<typename Ctx> Result<> describedcomptype(Ctx& ctx) {
   if (ctx.in.takeSExprStart("descriptor"sv)) {
-    auto x = typeidx(ctx);
-    CHECK_ERR(x);
-    ctx.setDescriptor(*x);
-    CHECK_ERR(comptype(ctx));
+    auto d = typeidx(ctx);
+    CHECK_ERR(d);
     if (!ctx.in.takeRParen()) {
-      return ctx.in.err("expected end of described type");
+      return ctx.in.err("expected end of descriptor");
     }
-    return Ok{};
+    ctx.setDescriptor(*d);
   }
   return comptype(ctx);
 }
 
-// describingcomptype ::= '(' 'describes' typeidx ct:describedcomptype ')'
-//                      | ct: describedcomptype
+// describingcomptype ::= '(' 'describes' typeidx ')' describedcomptype
+//                      | describedcomptype
 template<typename Ctx> Result<> describingcomptype(Ctx& ctx) {
   if (ctx.in.takeSExprStart("describes"sv)) {
-    auto x = typeidx(ctx);
-    CHECK_ERR(x);
-    ctx.setDescribes(*x);
-    CHECK_ERR(describedcomptype(ctx));
+    auto d = typeidx(ctx);
+    CHECK_ERR(d);
     if (!ctx.in.takeRParen()) {
-      return ctx.in.err("expected end of describing type");
+      return ctx.in.err("expected end of describes");
     }
-    return Ok{};
+    ctx.setDescribes(*d);
   }
   return describedcomptype(ctx);
 }
@@ -3083,7 +3253,7 @@ template<typename Ctx> MaybeResult<typename Ctx::LocalsT> locals(Ctx& ctx) {
 }
 
 // import ::= '(' 'import' mod:name nm:name importdesc ')'
-// importdesc ::= '(' 'func' id? typeuse ')'
+// importdesc ::= '(' 'func' id? exacttypeuse ')'
 //              | '(' 'table' id? tabletype ')'
 //              | '(' 'memory' id? memtype ')'
 //              | '(' 'global' id? globaltype ')'
@@ -3108,11 +3278,12 @@ template<typename Ctx> MaybeResult<> import_(Ctx& ctx) {
 
   if (ctx.in.takeSExprStart("func"sv)) {
     auto name = ctx.in.takeID();
-    auto type = typeuse(ctx);
-    CHECK_ERR(type);
+    auto use = exacttypeuse(ctx);
+    CHECK_ERR(use);
+    auto [type, exact] = *use;
     // TODO: function import annotations
     CHECK_ERR(ctx.addFunc(
-      name ? *name : Name{}, {}, &names, *type, std::nullopt, {}, pos));
+      name ? *name : Name{}, {}, &names, type, exact, std::nullopt, {}, pos));
   } else if (ctx.in.takeSExprStart("table"sv)) {
     auto name = ctx.in.takeID();
     auto type = tabletype(ctx);
@@ -3151,7 +3322,7 @@ template<typename Ctx> MaybeResult<> import_(Ctx& ctx) {
 // func ::= '(' 'func' id? ('(' 'export' name ')')*
 //              x,I:typeuse t*:vec(local) (in:instr)* ')'
 //        | '(' 'func' id? ('(' 'export' name ')')*
-//              '(' 'import' mod:name nm:name ')' typeuse ')'
+//              '(' 'import' mod:name nm:name ')' exacttypeuse ')'
 template<typename Ctx> MaybeResult<> func(Ctx& ctx) {
   auto pos = ctx.in.getPos();
   auto annotations = ctx.in.getAnnotations();
@@ -3171,11 +3342,19 @@ template<typename Ctx> MaybeResult<> func(Ctx& ctx) {
   auto import = inlineImport(ctx.in);
   CHECK_ERR(import);
 
-  auto type = typeuse(ctx);
-  CHECK_ERR(type);
-
+  typename Ctx::TypeUseT type;
+  Exactness exact = Exact;
   std::optional<typename Ctx::LocalsT> localVars;
-  if (!import) {
+
+  if (import) {
+    auto use = exacttypeuse(ctx);
+    CHECK_ERR(use);
+    type = use->first;
+    exact = use->second;
+  } else {
+    auto use = typeuse(ctx);
+    CHECK_ERR(use);
+    type = *use;
     if (auto l = locals(ctx)) {
       CHECK_ERR(l);
       localVars = *l;
@@ -3193,7 +3372,8 @@ template<typename Ctx> MaybeResult<> func(Ctx& ctx) {
   CHECK_ERR(ctx.addFunc(name,
                         *exports,
                         import.getPtr(),
-                        *type,
+                        type,
+                        exact,
                         localVars,
                         std::move(annotations),
                         pos));
@@ -3717,6 +3897,15 @@ template<typename Ctx> MaybeResult<> modulefield(Ctx& ctx) {
   return ctx.in.err("unrecognized module field");
 }
 
+// (m:modulefield)*
+template<typename Ctx> Result<> moduleBody(Ctx& ctx) {
+  while (auto field = modulefield(ctx)) {
+    CHECK_ERR(field);
+  }
+
+  return Ok{};
+}
+
 // module ::= '(' 'module' id? (m:modulefield)* ')'
 //          | (m:modulefield)* eof
 template<typename Ctx> Result<> module(Ctx& ctx) {
@@ -3728,9 +3917,7 @@ template<typename Ctx> Result<> module(Ctx& ctx) {
     }
   }
 
-  while (auto field = modulefield(ctx)) {
-    CHECK_ERR(field);
-  }
+  CHECK_ERR(moduleBody(ctx));
 
   if (outer && !ctx.in.takeRParen()) {
     return ctx.in.err("expected end of module");

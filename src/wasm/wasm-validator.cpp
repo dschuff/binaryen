@@ -31,6 +31,7 @@
 #include "ir/stack-utils.h"
 #include "ir/utils.h"
 #include "support/colors.h"
+#include "wasm-type.h"
 #include "wasm-validator.h"
 #include "wasm.h"
 
@@ -297,7 +298,7 @@ public:
   static void visitPreBlock(FunctionValidator* self, Expression** currp) {
     auto* curr = (*currp)->cast<Block>();
     if (curr->name.is()) {
-      self->breakTypes[curr->name];
+      self->breakTypes.try_emplace(curr->name);
     }
   }
 
@@ -308,7 +309,7 @@ public:
   static void visitPreLoop(FunctionValidator* self, Expression** currp) {
     auto* curr = (*currp)->cast<Loop>();
     if (curr->name.is()) {
-      self->breakTypes[curr->name];
+      self->breakTypes.try_emplace(curr->name);
     }
   }
 
@@ -451,6 +452,7 @@ public:
   void visitAtomicWait(AtomicWait* curr);
   void visitAtomicNotify(AtomicNotify* curr);
   void visitAtomicFence(AtomicFence* curr);
+  void visitPause(Pause* curr);
   void visitSIMDExtract(SIMDExtract* curr);
   void visitSIMDReplace(SIMDReplace* curr);
   void visitSIMDShuffle(SIMDShuffle* curr);
@@ -481,6 +483,7 @@ public:
   void visitTableFill(TableFill* curr);
   void visitTableCopy(TableCopy* curr);
   void visitTableInit(TableInit* curr);
+  void visitElemDrop(ElemDrop* curr);
   void noteDelegate(Name name, Expression* curr);
   void noteRethrow(Name name, Expression* curr);
   void visitTry(Try* curr);
@@ -495,6 +498,7 @@ public:
   void visitI31Get(I31Get* curr);
   void visitRefTest(RefTest* curr);
   void visitRefCast(RefCast* curr);
+  void visitRefGetDesc(RefGetDesc* curr);
   void visitBrOn(BrOn* curr);
   void visitStructNew(StructNew* curr);
   void visitStructGet(StructGet* curr);
@@ -502,7 +506,7 @@ public:
   void visitStructRMW(StructRMW* curr);
   void visitStructCmpxchg(StructCmpxchg* curr);
   void visitArrayNew(ArrayNew* curr);
-  template<typename ArrayNew> void visitArrayNew(ArrayNew* curr);
+  template<typename ArrayNew> void visitArrayNewSegment(ArrayNew* curr);
   void visitArrayNewData(ArrayNewData* curr);
   void visitArrayNewElem(ArrayNewElem* curr);
   void visitArrayNewFixed(ArrayNewFixed* curr);
@@ -514,12 +518,15 @@ public:
   template<typename ArrayInit> void visitArrayInit(ArrayInit* curr);
   void visitArrayInitData(ArrayInitData* curr);
   void visitArrayInitElem(ArrayInitElem* curr);
+  void visitArrayRMW(ArrayRMW* curr);
+  void visitArrayCmpxchg(ArrayCmpxchg* curr);
   void visitStringNew(StringNew* curr);
   void visitStringConst(StringConst* curr);
   void visitStringMeasure(StringMeasure* curr);
   void visitStringEncode(StringEncode* curr);
   void visitStringConcat(StringConcat* curr);
   void visitStringEq(StringEq* curr);
+  void visitStringTest(StringTest* curr);
   void visitStringWTF16Get(StringWTF16Get* curr);
   void visitStringSliceWTF(StringSliceWTF* curr);
   void visitContNew(ContNew* curr);
@@ -958,7 +965,7 @@ void FunctionValidator::visitCall(Call* curr) {
   if (!shouldBeTrue(!!target, curr, "call target must exist")) {
     return;
   }
-  validateCallParamsAndResult(curr, target->type);
+  validateCallParamsAndResult(curr, target->type.getHeapType());
 
   if (Intrinsics(*getModule()).isCallWithoutEffects(curr)) {
     // call.without.effects has the specific form of the last argument being a
@@ -1262,6 +1269,12 @@ void FunctionValidator::visitAtomicFence(AtomicFence* curr) {
                curr,
                "Currently only sequentially consistent atomics are supported, "
                "so AtomicFence's order should be 0");
+}
+
+void FunctionValidator::visitPause(Pause* curr) {
+  shouldBeTrue(getModule()->features.hasSharedEverything(),
+               curr,
+               "pause requires shared-everything [--enable-shared-everything]");
 }
 
 void FunctionValidator::visitSIMDExtract(SIMDExtract* curr) {
@@ -2372,9 +2385,10 @@ void FunctionValidator::visitRefFunc(RefFunc* curr) {
   if (!shouldBeTrue(!!func, curr, "function argument of ref.func must exist")) {
     return;
   }
-  shouldBeTrue(func->type == curr->type.getHeapType(),
-               curr,
-               "function reference type must match referenced function type");
+  shouldBeEqual(curr->type,
+                func->type,
+                curr,
+                "function reference type must match referenced function type");
 }
 
 void FunctionValidator::visitRefEq(RefEq* curr) {
@@ -2542,6 +2556,14 @@ void FunctionValidator::visitTableInit(TableInit* curr) {
                                     "table.init offset must be valid");
   shouldBeEqualOrFirstIsUnreachable(
     curr->size->type, Type(Type::i32), curr, "table.init size must be valid");
+}
+
+void FunctionValidator::visitElemDrop(ElemDrop* curr) {
+  shouldBeTrue(getModule()->features.hasBulkMemory(),
+               curr,
+               "elem.drop requires bulk-memory [--enable-bulk-memory]");
+  auto* segment = getModule()->getElementSegment(curr->segment);
+  shouldBeTrue(!!segment, curr, "elem.drop segment must exist");
 }
 
 void FunctionValidator::noteDelegate(Name name, Expression* curr) {
@@ -2887,6 +2909,10 @@ void FunctionValidator::visitI31Get(I31Get* curr) {
 void FunctionValidator::visitRefTest(RefTest* curr) {
   shouldBeTrue(
     getModule()->features.hasGC(), curr, "ref.test requires gc [--enable-gc]");
+
+  shouldBeTrue(
+    curr->castType.isCastable(), curr, "ref.test cannot cast to invalid type");
+
   if (curr->ref->type == Type::unreachable) {
     return;
   }
@@ -2903,12 +2929,40 @@ void FunctionValidator::visitRefTest(RefTest* curr) {
     curr->ref->type.getHeapType().getBottom(),
     curr,
     "ref.test target type and ref type must have a common supertype");
+
+  // If custom descriptors is not enabled, only trivial and null-checking exact
+  // casts are allowed, i.e. those where the operand is also exact and has the
+  // same heap type, but may differ in nullability. The result of these trivial
+  // exact casts does not change when the types are made inexact during binary
+  // writing.
+  if (!getModule()->features.hasCustomDescriptors()) {
+    shouldBeTrue(curr->castType.isInexact() || curr->castType.with(Nullable) ==
+                                                 curr->ref->type.with(Nullable),
+                 curr,
+                 "ref.test of exact type requires custom descriptors "
+                 "[--enable-custom-descriptors]");
+  }
+
+  shouldBeTrue(
+    curr->ref->type.isCastable(), curr, "ref.test cannot cast invalid type");
 }
 
 void FunctionValidator::visitRefCast(RefCast* curr) {
   shouldBeTrue(
     getModule()->features.hasGC(), curr, "ref.cast requires gc [--enable-gc]");
-  if (curr->ref->type == Type::unreachable) {
+
+  // Require descriptors to be valid even if the ref is unreachable.
+  if (curr->desc && curr->desc->type != Type::unreachable) {
+    auto descType = curr->desc->type;
+    bool isNull = descType.isNull();
+    bool isDescriptor =
+      descType.isRef() && descType.getHeapType().getDescribedType();
+    shouldBeTrue(isNull || isDescriptor,
+                 curr,
+                 "ref.cast_desc descriptor must be a descriptor reference");
+  }
+
+  if (curr->type == Type::unreachable) {
     return;
   }
   if (!shouldBeTrue(
@@ -2941,23 +2995,74 @@ void FunctionValidator::visitRefCast(RefCast* curr) {
   shouldBeTrue(curr->ref->type.isNullable() || curr->type.isNonNullable(),
                curr,
                "ref.cast null of non-nullable references are not allowed");
+
+  // See comment about exactness on visitRefTest.
+  if (!getModule()->features.hasCustomDescriptors()) {
+    shouldBeTrue(curr->type.isInexact() ||
+                   curr->type.with(Nullable) == curr->ref->type.with(Nullable),
+                 curr,
+                 "ref.cast to exact type requires custom descriptors "
+                 "[--enable-custom-descriptors]");
+  }
+
+  shouldBeTrue(
+    curr->ref->type.isCastable(), curr, "ref.cast cannot cast invalid type");
+  shouldBeTrue(
+    curr->type.isCastable(), curr, "ref.cast cannot cast to invalid type");
+
+  if (!curr->desc) {
+    return;
+  }
+
+  shouldBeTrue(getModule()->features.hasCustomDescriptors(),
+               curr,
+               "ref.cast_desc requires custom descriptors "
+               "[--enable-custom-descriptors]");
+  if (!shouldBeTrue(curr->desc && curr->desc->type.isRef(),
+                    curr,
+                    "ref.cast_desc descriptor must have ref type")) {
+    return;
+  }
+  auto descriptor = curr->desc->type.getHeapType();
+  if (descriptor.isBottom()) {
+    return;
+  }
+
+  auto described = descriptor.getDescribedType();
+  assert(described && "already checked descriptor");
+  shouldBeEqual(*described,
+                curr->type.getHeapType(),
+                curr,
+                "ref.cast_desc cast type should be described by descriptor");
+  shouldBeEqual(
+    curr->type.getExactness(),
+    curr->desc->type.getExactness(),
+    curr,
+    "ref.cast_desc cast exactness should match descriptor exactness");
+}
+
+void FunctionValidator::visitRefGetDesc(RefGetDesc* curr) {
+  shouldBeTrue(
+    getModule()->features.hasCustomDescriptors(),
+    curr,
+    "ref.get_desc requires custom descriptors [--enable-custom-descriptors]");
 }
 
 void FunctionValidator::visitBrOn(BrOn* curr) {
-  shouldBeTrue(getModule()->features.hasGC(),
-               curr,
-               "br_on_cast requires gc [--enable-gc]");
+  shouldBeTrue(
+    getModule()->features.hasGC(), curr, "br_on* requires gc [--enable-gc]");
   if (curr->ref->type == Type::unreachable) {
     return;
   }
   if (!shouldBeTrue(
-        curr->ref->type.isRef(), curr, "br_on_cast ref must have ref type")) {
+        curr->ref->type.isRef(), curr, "br_on* ref must have ref type")) {
     return;
   }
-  if (curr->op == BrOnCast || curr->op == BrOnCastFail) {
+  if (curr->op != BrOnNull && curr->op != BrOnNonNull) {
+    // Common validation for all br_on_cast*
     if (!shouldBeTrue(curr->castType.isRef(),
                       curr,
-                      "br_on_cast must have reference cast type")) {
+                      "br_on_cast* must have reference cast type")) {
       return;
     }
     shouldBeEqual(
@@ -2965,16 +3070,75 @@ void FunctionValidator::visitBrOn(BrOn* curr) {
       curr->ref->type.getHeapType().getBottom(),
       curr,
       "br_on_cast* target type and ref type must have a common supertype");
-    shouldBeSubType(
-      curr->castType,
-      curr->ref->type,
-      curr,
-      "br_on_cast* target type must be a subtype of its input type");
-  } else {
-    shouldBeEqual(curr->castType,
-                  Type(Type::none),
-                  curr,
-                  "non-cast br_on* must not set intendedType field");
+  }
+  switch (curr->op) {
+    case BrOnNull:
+    case BrOnNonNull:
+      shouldBeEqual(curr->castType,
+                    Type(Type::none),
+                    curr,
+                    "non-cast br_on* must not set castType field");
+      break;
+    case BrOnCastDesc:
+    case BrOnCastDescFail: {
+      shouldBeTrue(getModule()->features.hasCustomDescriptors(),
+                   curr,
+                   "br_on_cast_desc* requires custom descriptors "
+                   "[--enable-custom-descriptors]");
+      if (!shouldBeTrue(curr->desc && curr->desc->type.isRef(),
+                        curr,
+                        "br_on_cast_desc* descriptor must have ref type")) {
+        return;
+      }
+      auto descriptor = curr->desc->type.getHeapType();
+      if (!descriptor.isBottom()) {
+        auto described = descriptor.getDescribedType();
+        if (!shouldBeTrue(
+              bool(described),
+              curr,
+              "br_on_cast_desc* descriptor should have a described type")) {
+          return;
+        }
+        shouldBeEqual(
+          *described,
+          curr->castType.getHeapType(),
+          curr,
+          "br_on_cast_desc* cast type should be described by descriptor");
+        shouldBeEqual(
+          curr->castType.getExactness(),
+          curr->desc->type.getExactness(),
+          curr,
+          "br_on_cast_desc* cast exactness should match descriptor exactness");
+        shouldBeTrue(curr->ref->type.isNullable() ||
+                       curr->castType.isNonNullable(),
+                     curr,
+                     "br_on_cast_desc* with non-nullable ref should have "
+                     "non-nullable cast type");
+      }
+      break;
+    }
+    case BrOnCast:
+    case BrOnCastFail: {
+      shouldBeSubType(
+        curr->castType,
+        curr->ref->type,
+        curr,
+        "br_on_cast* target type must be a subtype of its input type");
+      // See comment about exactness on visitRefTest.
+      if (!getModule()->features.hasCustomDescriptors()) {
+        shouldBeTrue(curr->castType.isInexact() ||
+                       curr->castType.with(Nullable) ==
+                         curr->ref->type.with(Nullable),
+                     curr,
+                     "br_on_cast* to exact type requires custom descriptors "
+                     "[--enable-custom-descriptors]");
+      }
+      shouldBeTrue(
+        curr->ref->type.isCastable(), curr, "br_on cannot cast invalid type");
+      shouldBeTrue(
+        curr->castType.isCastable(), curr, "br_on cannot cast to invalid type");
+      break;
+    }
   }
   noteBreak(curr->name, curr->getSentType(), curr);
 }
@@ -2991,6 +3155,7 @@ void FunctionValidator::visitStructNew(StructNew* curr) {
                     "struct.new should have a non-nullable reference type")) {
     return;
   }
+  shouldBeTrue(curr->type.isExact(), curr, "struct.new should be exact");
   auto heapType = curr->type.getHeapType();
   if (!shouldBeTrue(
         heapType.isStruct(), curr, "struct.new heap type must be struct")) {
@@ -3022,6 +3187,24 @@ void FunctionValidator::visitStructNew(StructNew* curr) {
         }
       }
     }
+  }
+
+  auto descType = curr->type.getHeapType().getDescriptorType();
+  if (!descType) {
+    shouldBeFalse(curr->desc,
+                  curr,
+                  "struct.new of type without descriptor should lack one");
+  } else {
+    if (!shouldBeTrue(
+          curr->desc,
+          curr,
+          "struct.new of type with descriptor requires descriptor operand")) {
+      return;
+    }
+    shouldBeSubType(curr->desc->type,
+                    Type(*descType, Nullable, Exact),
+                    curr,
+                    "struct.new descriptor operand should have proper type");
   }
 }
 
@@ -3229,6 +3412,7 @@ void FunctionValidator::visitArrayNew(ArrayNew* curr) {
                     "array.new should have a non-nullable reference type")) {
     return;
   }
+  shouldBeTrue(curr->type.isExact(), curr, "array.new* should be exact");
   auto heapType = curr->type.getHeapType();
   if (!shouldBeTrue(
         heapType.isArray(), curr, "array.new heap type must be array")) {
@@ -3253,7 +3437,7 @@ void FunctionValidator::visitArrayNew(ArrayNew* curr) {
 }
 
 template<typename ArrayNew>
-void FunctionValidator::visitArrayNew(ArrayNew* curr) {
+void FunctionValidator::visitArrayNewSegment(ArrayNew* curr) {
   shouldBeTrue(getModule()->features.hasGC(),
                curr,
                "array.new_{data, elem} requires gc [--enable-gc]");
@@ -3276,6 +3460,8 @@ void FunctionValidator::visitArrayNew(ArrayNew* curr) {
         "array.new_{data, elem} type should be an array reference")) {
     return;
   }
+  shouldBeTrue(
+    curr->type.isExact(), curr, "array.new_{data, elem} should be exact");
   auto heapType = curr->type.getHeapType();
   if (!shouldBeTrue(
         heapType.isArray(),
@@ -3286,7 +3472,7 @@ void FunctionValidator::visitArrayNew(ArrayNew* curr) {
 }
 
 void FunctionValidator::visitArrayNewData(ArrayNewData* curr) {
-  visitArrayNew(curr);
+  visitArrayNewSegment(curr);
 
   shouldBeTrue(
     getModule()->features.hasBulkMemory(),
@@ -3309,7 +3495,7 @@ void FunctionValidator::visitArrayNewData(ArrayNewData* curr) {
 }
 
 void FunctionValidator::visitArrayNewElem(ArrayNewElem* curr) {
-  visitArrayNew(curr);
+  visitArrayNewSegment(curr);
 
   if (!shouldBeTrue(getModule()->getElementSegment(curr->segment),
                     curr,
@@ -3332,13 +3518,14 @@ void FunctionValidator::visitArrayNewElem(ArrayNewElem* curr) {
 void FunctionValidator::visitArrayNewFixed(ArrayNewFixed* curr) {
   shouldBeTrue(getModule()->features.hasGC(),
                curr,
-               "array.init requires gc [--enable-gc]");
+               "array.new_fixed requires gc [--enable-gc]");
   if (curr->type == Type::unreachable) {
     return;
   }
+  shouldBeTrue(curr->type.isExact(), curr, "array.new_fixed should be exact");
   auto heapType = curr->type.getHeapType();
   if (!shouldBeTrue(
-        heapType.isArray(), curr, "array.init heap type must be array")) {
+        heapType.isArray(), curr, "array.new_fixed heap type must be array")) {
     return;
   }
   const auto& element = heapType.getArray().element;
@@ -3346,7 +3533,7 @@ void FunctionValidator::visitArrayNewFixed(ArrayNewFixed* curr) {
     shouldBeSubType(value->type,
                     element.type,
                     curr,
-                    "array.init value must have proper type");
+                    "array.new_fixed value must have proper type");
   }
 }
 
@@ -3566,10 +3753,116 @@ void FunctionValidator::visitArrayInitElem(ArrayInitElem* curr) {
                   "array.init_elem segment type must match destination type");
 }
 
+void FunctionValidator::visitArrayRMW(ArrayRMW* curr) {
+  auto expected =
+    FeatureSet::GC | FeatureSet::Atomics | FeatureSet::SharedEverything;
+  if (!shouldBeTrue(expected <= getModule()->features,
+                    curr,
+                    "array.atomic.rmw requires additional features ")) {
+    getStream() << getMissingFeaturesList(*getModule(), expected) << '\n';
+  }
+  if (curr->ref->type == Type::unreachable) {
+    return;
+  }
+  if (!shouldBeTrue(curr->ref->type.isRef(),
+                    curr->ref,
+                    "array.atomic.rmw ref must be a reference type")) {
+    return;
+  }
+  auto type = curr->ref->type.getHeapType();
+  if (type.isMaybeShared(HeapType::none)) {
+    return;
+  }
+  if (!shouldBeTrue(
+        type.isArray(), curr->ref, "array.atomic.rmw ref must be a array")) {
+    return;
+  }
+  const auto& element = type.getArray().element;
+  shouldBeEqual(element.mutable_,
+                Mutable,
+                curr,
+                "array.atomic.rmw element must be mutable");
+  shouldBeFalse(
+    element.isPacked(), curr, "array.atomic.rmw element must not be packed");
+  bool isAny =
+    element.type.isRef() &&
+    Type::isSubType(
+      element.type,
+      Type(HeapTypes::any.getBasic(element.type.getHeapType().getShared()),
+           Nullable));
+  if (!shouldBeTrue(element.type == Type::i32 || element.type == Type::i64 ||
+                      (isAny && curr->op == RMWXchg),
+                    curr,
+                    "array.atomic.rmw element type invalid for operation")) {
+    return;
+  }
+  shouldBeSubType(curr->value->type,
+                  element.type,
+                  curr,
+                  "array.atomic.rmw value must have the proper type");
+}
+
+void FunctionValidator::visitArrayCmpxchg(ArrayCmpxchg* curr) {
+  auto expected =
+    FeatureSet::GC | FeatureSet::Atomics | FeatureSet::SharedEverything;
+  if (!shouldBeTrue(expected <= getModule()->features,
+                    curr,
+                    "array.atomic.rmw requires additional features ")) {
+    getStream() << getMissingFeaturesList(*getModule(), expected) << '\n';
+  }
+  if (curr->ref->type == Type::unreachable) {
+    return;
+  }
+  if (!shouldBeTrue(curr->ref->type.isRef(),
+                    curr->ref,
+                    "array.atomic.rmw ref must be a reference type")) {
+    return;
+  }
+  auto type = curr->ref->type.getHeapType();
+  if (type.isMaybeShared(HeapType::none)) {
+    return;
+  }
+  if (!shouldBeTrue(
+        type.isArray(), curr->ref, "array.atomic.rmw ref must be a array")) {
+    return;
+  }
+  const auto& element = type.getArray().element;
+  shouldBeEqual(element.mutable_,
+                Mutable,
+                curr,
+                "array.atomic.rmw element must be mutable");
+  shouldBeFalse(
+    element.isPacked(), curr, "array.atomic.rmw element must not be packed");
+
+  Type expectedExpectedType;
+  if (element.type == Type::i32) {
+    expectedExpectedType = Type::i32;
+  } else if (element.type == Type::i64) {
+    expectedExpectedType = Type::i64;
+  } else if (element.type.isRef()) {
+    expectedExpectedType = Type(
+      HeapTypes::eq.getBasic(element.type.getHeapType().getShared()), Nullable);
+  } else {
+    shouldBeTrue(
+      false, curr, "array.atomic.rmw element type invalid for operation");
+    return;
+  }
+  shouldBeSubType(
+    curr->expected->type,
+    expectedExpectedType,
+    curr,
+    "array.atomic.rmw.cmpxchg expected value must have the proper type");
+  shouldBeSubType(
+    curr->replacement->type,
+    element.type,
+    curr,
+    "array.atomic.rmw.cmpxchg replacement value must have the proper type");
+}
+
 void FunctionValidator::visitStringNew(StringNew* curr) {
   shouldBeTrue(!getModule() || getModule()->features.hasStrings(),
                curr,
-               "string operations require reference-types [--enable-strings]");
+               "string operations require strings [--enable-strings]");
 
   switch (curr->op) {
     case StringNewLossyUTF8Array:
@@ -3582,11 +3875,19 @@ void FunctionValidator::visitStringNew(StringNew* curr) {
             refType.isRef(), curr, "string.new input must have array type")) {
         return;
       }
-      auto heapType = refType.getHeapType();
-      if (!shouldBeTrue(heapType.isBottom() || heapType.isArray(),
-                        curr,
-                        "string.new input must have array type")) {
-        return;
+      if (curr->op == StringNewLossyUTF8Array) {
+        shouldBeSubType(
+          refType,
+          Type(HeapTypes::getMutI8Array(), Nullable),
+          curr,
+          "string.new_lossy_utf8_array input must have proper i8 array type");
+      } else {
+        assert(curr->op == StringNewWTF16Array);
+        shouldBeSubType(
+          refType,
+          Type(HeapTypes::getMutI16Array(), Nullable),
+          curr,
+          "string.new_wtf16_array input must have proper i16 array type");
       }
       shouldBeEqualOrFirstIsUnreachable(curr->start->type,
                                         Type(Type::i32),
@@ -3614,43 +3915,74 @@ void FunctionValidator::visitStringNew(StringNew* curr) {
 void FunctionValidator::visitStringConst(StringConst* curr) {
   shouldBeTrue(!getModule() || getModule()->features.hasStrings(),
                curr,
-               "string operations require reference-types [--enable-strings]");
+               "string operations require strings [--enable-strings]");
 }
 
 void FunctionValidator::visitStringMeasure(StringMeasure* curr) {
   shouldBeTrue(!getModule() || getModule()->features.hasStrings(),
                curr,
-               "string operations require reference-types [--enable-strings]");
+               "string operations require strings [--enable-strings]");
 }
 
 void FunctionValidator::visitStringEncode(StringEncode* curr) {
   shouldBeTrue(!getModule() || getModule()->features.hasStrings(),
                curr,
-               "string operations require reference-types [--enable-strings]");
+               "string operations require strings [--enable-strings]");
+  shouldBeSubTypeIgnoringShared(curr->str->type,
+                                Type(HeapType::ext, Nullable),
+                                curr,
+                                "string.encode input should be an externref");
+  switch (curr->op) {
+    case StringEncodeLossyUTF8Array:
+      shouldBeSubType(
+        curr->array->type,
+        Type(HeapTypes::getMutI8Array(), Nullable),
+        curr,
+        "string.encode_lossy_utf8_array should have mutable i8 array");
+      break;
+    case StringEncodeWTF16Array: {
+      shouldBeSubType(
+        curr->array->type,
+        Type(HeapTypes::getMutI16Array(), Nullable),
+        curr,
+        "string.encode_wtf16_array should have mutable i16 array");
+      break;
+    }
+  }
+  shouldBeSubType(curr->start->type,
+                  Type(Type::i32),
+                  curr,
+                  "string.encode start should be an i32");
 }
 
 void FunctionValidator::visitStringConcat(StringConcat* curr) {
   shouldBeTrue(!getModule() || getModule()->features.hasStrings(),
                curr,
-               "string operations require reference-types [--enable-strings]");
+               "string operations require strings [--enable-strings]");
 }
 
 void FunctionValidator::visitStringEq(StringEq* curr) {
   shouldBeTrue(!getModule() || getModule()->features.hasStrings(),
                curr,
-               "string operations require reference-types [--enable-strings]");
+               "string operations require strings [--enable-strings]");
+}
+
+void FunctionValidator::visitStringTest(StringTest* curr) {
+  shouldBeTrue(!getModule() || getModule()->features.hasStrings(),
+               curr,
+               "string operations require strings [--enable-strings]");
 }
 
 void FunctionValidator::visitStringWTF16Get(StringWTF16Get* curr) {
   shouldBeTrue(!getModule() || getModule()->features.hasStrings(),
                curr,
-               "string operations require reference-types [--enable-strings]");
+               "string operations require strings [--enable-strings]");
 }
 
 void FunctionValidator::visitStringSliceWTF(StringSliceWTF* curr) {
   shouldBeTrue(!getModule() || getModule()->features.hasStrings(),
                curr,
-               "string operations require reference-types [--enable-strings]");
+               "string operations require strings [--enable-strings]");
 }
 
 void FunctionValidator::visitContNew(ContNew* curr) {
@@ -3668,11 +4000,20 @@ void FunctionValidator::visitContNew(ContNew* curr) {
                     "cont.new should have a non-nullable reference type")) {
     return;
   }
+  shouldBeTrue(curr->type.isExact(), curr, "cont.new should be exact");
 
-  shouldBeTrue(curr->type.isContinuation() &&
-                 curr->type.getHeapType().getContinuation().type.isSignature(),
+  if (!shouldBeTrue(curr->type.isContinuation(),
+                    curr,
+                    "cont.new must be annotated with a continuation type")) {
+    return;
+  }
+
+  auto cont = curr->type.getHeapType().getContinuation();
+  assert(cont.type.isSignature());
+
+  shouldBeTrue(HeapType::isSubType(curr->func->type.getHeapType(), cont.type),
                curr,
-               "cont.new must be annotated with a continuation type");
+               "cont.new function reference must be a subtype");
 }
 
 void FunctionValidator::visitContBind(ContBind* curr) {
@@ -3681,29 +4022,33 @@ void FunctionValidator::visitContBind(ContBind* curr) {
                curr,
                "cont.bind requires stack-switching [--enable-stack-switching]");
 
-  shouldBeTrue(
-    (curr->cont->type.isContinuation() &&
-     curr->cont->type.getHeapType().getContinuation().type.isSignature()) ||
-      curr->cont->type == Type::unreachable,
-    curr,
-    "the first type annotation on cont.bind must be a continuation type");
-
-  shouldBeTrue(
-    (curr->type.isContinuation() &&
-     curr->type.getHeapType().getContinuation().type.isSignature()) ||
-      curr->type == Type::unreachable,
-    curr,
-    "the second type annotation on cont.bind must be a continuation type");
+  if (curr->cont->type.isRef() &&
+      curr->cont->type.getHeapType().isMaybeShared(HeapType::nocont)) {
+    return;
+  }
 
   if (curr->type == Type::unreachable) {
     return;
   }
+
+  shouldBeTrue(
+    curr->cont->type.isContinuation() &&
+      curr->cont->type.getHeapType().getContinuation().type.isSignature(),
+    curr,
+    "the first type annotation on cont.bind must be a continuation type");
+
+  shouldBeTrue(
+    curr->type.isContinuation() &&
+      curr->type.getHeapType().getContinuation().type.isSignature(),
+    curr,
+    "the second type annotation on cont.bind must be a continuation type");
 
   if (!shouldBeTrue(curr->type.isNonNullable(),
                     curr,
                     "cont.bind should have a non-nullable reference type")) {
     return;
   }
+  shouldBeTrue(curr->type.isExact(), curr, "cont.bind should be exact");
 }
 
 void FunctionValidator::visitSuspend(Suspend* curr) {
@@ -3723,6 +4068,11 @@ void FunctionValidator::visitResume(Resume* curr) {
     curr->sentTypes.size() == curr->handlerBlocks.size(),
     curr,
     "sentTypes cache in resume instruction has not been initialized");
+
+  if (curr->cont->type.isRef() &&
+      curr->cont->type.getHeapType().isMaybeShared(HeapType::nocont)) {
+    return;
+  }
 
   shouldBeTrue(
     (curr->cont->type.isContinuation() &&
@@ -3746,17 +4096,42 @@ void FunctionValidator::visitResumeThrow(ResumeThrow* curr) {
     curr,
     "sentTypes cache in resume_throw instruction has not been initialized");
 
+  if (curr->tag) {
+    // Normal resume_throw
+    auto* tag = getModule()->getTagOrNull(curr->tag);
+    if (!shouldBeTrue(!!tag, curr, "resume_throw exception tag must exist")) {
+      return;
+    }
+    shouldBeEqual(curr->operands.size(),
+                  tag->params().size(),
+                  curr,
+                  "resume_throw num operands must match the tag");
+    // TODO: validate operand types as well
+  } else {
+    // resume_throw_ref
+    Type exnref = Type(HeapType::exn, Nullable);
+    if (shouldBeEqual(curr->operands.size(),
+                      size_t(1),
+                      curr,
+                      "resume_throw_ref must have a single exnref operand")) {
+      shouldBeSubType(curr->operands[0]->type,
+                      exnref,
+                      curr,
+                      "resume_throw_ref must receive exnref");
+    }
+  }
+
+  if (curr->cont->type.isRef() &&
+      curr->cont->type.getHeapType().isMaybeShared(HeapType::nocont)) {
+    return;
+  }
+
   shouldBeTrue(
     (curr->cont->type.isContinuation() &&
      curr->cont->type.getHeapType().getContinuation().type.isSignature()) ||
       curr->type == Type::unreachable,
     curr,
     "resume_throw must be annotated with a continuation type");
-
-  auto* tag = getModule()->getTagOrNull(curr->tag);
-  if (!shouldBeTrue(!!tag, curr, "resume_throw must be annotated with a tag")) {
-    return;
-  }
 }
 
 void FunctionValidator::visitStackSwitch(StackSwitch* curr) {
@@ -3765,17 +4140,22 @@ void FunctionValidator::visitStackSwitch(StackSwitch* curr) {
                curr,
                "switch requires stack-switching [--enable-stack-switching]");
 
+  auto* tag = getModule()->getTagOrNull(curr->tag);
+  if (!shouldBeTrue(!!tag, curr, "switch tag must exist")) {
+    return;
+  }
+
+  if (curr->cont->type.isRef() &&
+      curr->cont->type.getHeapType().isMaybeShared(HeapType::nocont)) {
+    return;
+  }
+
   shouldBeTrue(
     (curr->cont->type.isContinuation() &&
      curr->cont->type.getHeapType().getContinuation().type.isSignature()) ||
       curr->type == Type::unreachable,
     curr,
     "switch must be annotated with a continuation type");
-
-  auto* tag = getModule()->getTagOrNull(curr->tag);
-  if (!shouldBeTrue(!!tag, curr, "switch must be annotated with a tag")) {
-    return;
-  }
 }
 
 void FunctionValidator::visitFunction(Function* curr) {
@@ -3798,6 +4178,16 @@ void FunctionValidator::visitFunction(Function* curr) {
   shouldBeTrue(features <= getModule()->features,
                curr->name,
                "all used types should be allowed");
+
+  if (curr->imported()) {
+    shouldBeTrue(
+      curr->type.isInexact() || getModule()->features.hasCustomDescriptors(),
+      curr->name,
+      "exact imports require custom descriptors [--enable-custom-descriptors]");
+  } else {
+    shouldBeTrue(
+      curr->type.isExact(), curr->name, "defined function should be exact");
+  }
 
   // validate optional local names
   std::unordered_set<Name> seen;
@@ -3938,6 +4328,34 @@ static void validateBinaryenIR(Module& wasm, ValidationInfo& info) {
 }
 
 // Main validator class
+
+static void validateTypes(Module& module, ValidationInfo& info) {
+  // Check that public types do not contain any exact references if custom
+  // descriptors is not enabled. If they did, we would erase the exactness
+  // during binary writing and change the public type identities.
+  if (module.features.hasCustomDescriptors()) {
+    return;
+  }
+
+  for (auto type : ModuleUtils::getPublicHeapTypes(module)) {
+    for (auto child : type.getTypeChildren()) {
+      if (child.isExact()) {
+        std::string typeName;
+        if (auto it = module.typeNames.find(type);
+            it != module.typeNames.end()) {
+          typeName = '$' + it->second.name.toString();
+        } else {
+          typeName = type.toString();
+        }
+        info.fail("Exact reference in public type not allowed without custom "
+                  "descriptors [--enable-custom-descriptors]",
+                  typeName,
+                  nullptr);
+        break;
+      }
+    }
+  }
+}
 
 static void validateImports(Module& module, ValidationInfo& info) {
   ModuleUtils::iterImportedFunctions(module, [&](Function* curr) {
@@ -4408,6 +4826,7 @@ bool WasmValidator::validate(Module& module, Flags flags) {
 
   // Validate globally.
   if (info.validateGlobally) {
+    validateTypes(module, info);
     validateImports(module, info);
     validateExports(module, info);
     validateGlobals(module, info);

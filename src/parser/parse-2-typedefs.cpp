@@ -22,9 +22,9 @@ Result<> parseTypeDefs(
   ParseDeclsCtx& decls,
   Lexer& input,
   IndexMap& typeIndices,
-  std::vector<HeapTypeDef>& types,
-  std::unordered_map<HeapTypeDef, std::unordered_map<Name, Index>>& typeNames) {
-  TypeBuilder builder(decls.typeDefs.size());
+  std::vector<HeapType>& types,
+  std::unordered_map<HeapType, std::unordered_map<Name, Index>>& typeNames) {
+  TypeBuilder builder(decls.typeDefs.size(), decls.wasm.features);
   ParseTypeDefsCtx ctx(input, builder, typeIndices);
   for (auto& recType : decls.recTypeDefs) {
     WithPosition with(ctx, recType.pos);

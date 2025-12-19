@@ -22,6 +22,102 @@ switch (buf[0]) {
         goto parse_error;
       case 'r': {
         switch (buf[6]) {
+          case 'a': {
+            switch (buf[13]) {
+              case 'g': {
+                switch (buf[16]) {
+                  case '\0':
+                    if (op == "array.atomic.get"sv) {
+                      CHECK_ERR(makeAtomicArrayGet(ctx, pos, annotations));
+                      return Ok{};
+                    }
+                    goto parse_error;
+                  case '_': {
+                    switch (buf[17]) {
+                      case 's':
+                        if (op == "array.atomic.get_s"sv) {
+                          CHECK_ERR(makeAtomicArrayGet(ctx, pos, annotations, true));
+                          return Ok{};
+                        }
+                        goto parse_error;
+                      case 'u':
+                        if (op == "array.atomic.get_u"sv) {
+                          CHECK_ERR(makeAtomicArrayGet(ctx, pos, annotations, false));
+                          return Ok{};
+                        }
+                        goto parse_error;
+                      default: goto parse_error;
+                    }
+                  }
+                  default: goto parse_error;
+                }
+              }
+              case 'r': {
+                switch (buf[17]) {
+                  case 'a': {
+                    switch (buf[18]) {
+                      case 'd':
+                        if (op == "array.atomic.rmw.add"sv) {
+                          CHECK_ERR(makeArrayRMW(ctx, pos, annotations, RMWAdd));
+                          return Ok{};
+                        }
+                        goto parse_error;
+                      case 'n':
+                        if (op == "array.atomic.rmw.and"sv) {
+                          CHECK_ERR(makeArrayRMW(ctx, pos, annotations, RMWAnd));
+                          return Ok{};
+                        }
+                        goto parse_error;
+                      default: goto parse_error;
+                    }
+                  }
+                  case 'c':
+                    if (op == "array.atomic.rmw.cmpxchg"sv) {
+                      CHECK_ERR(makeArrayCmpxchg(ctx, pos, annotations));
+                      return Ok{};
+                    }
+                    goto parse_error;
+                  case 'o':
+                    if (op == "array.atomic.rmw.or"sv) {
+                      CHECK_ERR(makeArrayRMW(ctx, pos, annotations, RMWOr));
+                      return Ok{};
+                    }
+                    goto parse_error;
+                  case 's':
+                    if (op == "array.atomic.rmw.sub"sv) {
+                      CHECK_ERR(makeArrayRMW(ctx, pos, annotations, RMWSub));
+                      return Ok{};
+                    }
+                    goto parse_error;
+                  case 'x': {
+                    switch (buf[18]) {
+                      case 'c':
+                        if (op == "array.atomic.rmw.xchg"sv) {
+                          CHECK_ERR(makeArrayRMW(ctx, pos, annotations, RMWXchg));
+                          return Ok{};
+                        }
+                        goto parse_error;
+                      case 'o':
+                        if (op == "array.atomic.rmw.xor"sv) {
+                          CHECK_ERR(makeArrayRMW(ctx, pos, annotations, RMWXor));
+                          return Ok{};
+                        }
+                        goto parse_error;
+                      default: goto parse_error;
+                    }
+                  }
+                  default: goto parse_error;
+                }
+              }
+              case 's':
+                if (op == "array.atomic.set"sv) {
+                  CHECK_ERR(makeAtomicArraySet(ctx, pos, annotations));
+                  return Ok{};
+                }
+                goto parse_error;
+              default: goto parse_error;
+            }
+          }
           case 'c':
             if (op == "array.copy"sv) {
               CHECK_ERR(makeArrayCopy(ctx, pos, annotations));
@@ -170,16 +266,38 @@ switch (buf[0]) {
                 switch (buf[10]) {
                   case '\0':
                     if (op == "br_on_cast"sv) {
-                      CHECK_ERR(makeBrOnCast(ctx, pos, annotations));
+                      CHECK_ERR(makeBrOnCast(ctx, pos, annotations, BrOnCast));
                       return Ok{};
                     }
                     goto parse_error;
-                  case '_':
-                    if (op == "br_on_cast_fail"sv) {
-                      CHECK_ERR(makeBrOnCast(ctx, pos, annotations, true));
-                      return Ok{};
+                  case '_': {
+                    switch (buf[11]) {
+                      case 'd': {
+                        switch (buf[15]) {
+                          case '\0':
+                            if (op == "br_on_cast_desc"sv) {
+                              CHECK_ERR(makeBrOnCast(ctx, pos, annotations, BrOnCastDesc));
+                              return Ok{};
+                            }
+                            goto parse_error;
+                          case '_':
+                            if (op == "br_on_cast_desc_fail"sv) {
+                              CHECK_ERR(makeBrOnCast(ctx, pos, annotations, BrOnCastDescFail));
+                              return Ok{};
+                            }
+                            goto parse_error;
+                          default: goto parse_error;
+                        }
+                      }
+                      case 'f':
+                        if (op == "br_on_cast_fail"sv) {
+                          CHECK_ERR(makeBrOnCast(ctx, pos, annotations, BrOnCastFail));
+                          return Ok{};
+                        }
+                        goto parse_error;
+                      default: goto parse_error;
                     }
-                    goto parse_error;
+                  }
                   default: goto parse_error;
                 }
               }
@@ -283,25 +401,36 @@ switch (buf[0]) {
     }
   }
   case 'e': {
-    switch (buf[7]) {
-      case 'c':
-        if (op == "extern.convert_any"sv) {
-          CHECK_ERR(makeRefAs(ctx, pos, annotations, ExternConvertAny));
+    switch (buf[1]) {
+      case 'l':
+        if (op == "elem.drop"sv) {
+          CHECK_ERR(makeElemDrop(ctx, pos, annotations));
           return Ok{};
         }
         goto parse_error;
-      case 'e':
-        if (op == "extern.externalize"sv) {
-          CHECK_ERR(makeRefAs(ctx, pos, annotations, ExternConvertAny));
-          return Ok{};
+      case 'x': {
+        switch (buf[7]) {
+          case 'c':
+            if (op == "extern.convert_any"sv) {
+              CHECK_ERR(makeRefAs(ctx, pos, annotations, ExternConvertAny));
+              return Ok{};
+            }
+            goto parse_error;
+          case 'e':
+            if (op == "extern.externalize"sv) {
+              CHECK_ERR(makeRefAs(ctx, pos, annotations, ExternConvertAny));
+              return Ok{};
+            }
+            goto parse_error;
+          case 'i':
+            if (op == "extern.internalize"sv) {
+              CHECK_ERR(makeRefAs(ctx, pos, annotations, AnyConvertExtern));
+              return Ok{};
+            }
+            goto parse_error;
+          default: goto parse_error;
         }
-        goto parse_error;
-      case 'i':
-        if (op == "extern.internalize"sv) {
-          CHECK_ERR(makeRefAs(ctx, pos, annotations, AnyConvertExtern));
-          return Ok{};
-        }
-        goto parse_error;
+      }
       default: goto parse_error;
     }
   }
@@ -4730,12 +4859,23 @@ switch (buf[0]) {
       return Ok{};
     }
     goto parse_error;
-  case 'p':
-    if (op == "pop"sv) {
-      CHECK_ERR(makePop(ctx, pos, annotations));
-      return Ok{};
+  case 'p': {
+    switch (buf[1]) {
+      case 'a':
+        if (op == "pause"sv) {
+          CHECK_ERR(makePause(ctx, pos, annotations));
+          return Ok{};
+        }
+        goto parse_error;
+      case 'o':
+        if (op == "pop"sv) {
+          CHECK_ERR(makePop(ctx, pos, annotations));
+          return Ok{};
+        }
+        goto parse_error;
+      default: goto parse_error;
     }
-    goto parse_error;
+  }
   case 'r': {
     switch (buf[2]) {
       case 'f': {
@@ -4746,12 +4886,23 @@ switch (buf[0]) {
               return Ok{};
             }
             goto parse_error;
-          case 'c':
-            if (op == "ref.cast"sv) {
-              CHECK_ERR(makeRefCast(ctx, pos, annotations));
-              return Ok{};
+          case 'c': {
+            switch (buf[8]) {
+              case '\0':
+                if (op == "ref.cast"sv) {
+                  CHECK_ERR(makeRefCast(ctx, pos, annotations, false));
+                  return Ok{};
+                }
+                goto parse_error;
+              case '_':
+                if (op == "ref.cast_desc"sv) {
+                  CHECK_ERR(makeRefCast(ctx, pos, annotations, true));
+                  return Ok{};
+                }
+                goto parse_error;
+              default: goto parse_error;
             }
-            goto parse_error;
+          }
           case 'e':
             if (op == "ref.eq"sv) {
               CHECK_ERR(makeRefEq(ctx, pos, annotations));
@@ -4761,6 +4912,12 @@ switch (buf[0]) {
           case 'f':
             if (op == "ref.func"sv) {
               CHECK_ERR(makeRefFunc(ctx, pos, annotations));
+              return Ok{};
+            }
+            goto parse_error;
+          case 'g':
+            if (op == "ref.get_desc"sv) {
+              CHECK_ERR(makeRefGetDesc(ctx, pos, annotations));
               return Ok{};
             }
             goto parse_error;
@@ -4815,12 +4972,23 @@ switch (buf[0]) {
               return Ok{};
             }
             goto parse_error;
-          case '_':
-            if (op == "resume_throw"sv) {
-              CHECK_ERR(makeResumeThrow(ctx, pos, annotations));
-              return Ok{};
+          case '_': {
+            switch (buf[12]) {
+              case '\0':
+                if (op == "resume_throw"sv) {
+                  CHECK_ERR(makeResumeThrow(ctx, pos, annotations));
+                  return Ok{};
+                }
+                goto parse_error;
+              case '_':
+                if (op == "resume_throw_ref"sv) {
+                  CHECK_ERR(makeResumeThrowRef(ctx, pos, annotations));
+                  return Ok{};
+                }
+                goto parse_error;
+              default: goto parse_error;
             }
-            goto parse_error;
+          }
           default: goto parse_error;
         }
       }
@@ -4993,6 +5161,12 @@ switch (buf[0]) {
                       default: goto parse_error;
                     }
                   }
+                  case 't':
+                    if (op == "string.test"sv) {
+                      CHECK_ERR(makeStringTest(ctx, pos, annotations));
+                      return Ok{};
+                    }
+                    goto parse_error;
                   default: goto parse_error;
                 }
               }
@@ -5152,16 +5326,38 @@ switch (buf[0]) {
                 switch (buf[10]) {
                   case '\0':
                     if (op == "struct.new"sv) {
-                      CHECK_ERR(makeStructNew(ctx, pos, annotations, false));
+                      CHECK_ERR(makeStructNew(ctx, pos, annotations, false, false));
                       return Ok{};
                     }
                     goto parse_error;
-                  case '_':
-                    if (op == "struct.new_default"sv) {
-                      CHECK_ERR(makeStructNew(ctx, pos, annotations, true));
-                      return Ok{};
+                  case '_': {
+                    switch (buf[13]) {
+                      case 'f': {
+                        switch (buf[18]) {
+                          case '\0':
+                            if (op == "struct.new_default"sv) {
+                              CHECK_ERR(makeStructNew(ctx, pos, annotations, true, false));
+                              return Ok{};
+                            }
+                            goto parse_error;
+                          case '_':
+                            if (op == "struct.new_default_desc"sv) {
+                              CHECK_ERR(makeStructNew(ctx, pos, annotations, true, true));
+                              return Ok{};
+                            }
+                            goto parse_error;
+                          default: goto parse_error;
+                        }
+                      }
+                      case 's':
+                        if (op == "struct.new_desc"sv) {
+                          CHECK_ERR(makeStructNew(ctx, pos, annotations, false, true));
+                          return Ok{};
+                        }
+                        goto parse_error;
+                      default: goto parse_error;
                     }
-                    goto parse_error;
+                  }
                   default: goto parse_error;
                 }
               }

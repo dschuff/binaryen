@@ -154,7 +154,6 @@
 #include "ir/bits.h"
 #include "ir/branch-utils.h"
 #include "ir/eh-utils.h"
-#include "ir/find_all.h"
 #include "ir/local-graph.h"
 #include "ir/parents.h"
 #include "ir/properties.h"
@@ -395,11 +394,25 @@ struct EscapeAnalyzer {
         // Whether the cast succeeds or fails, it does not escape.
         escapes = false;
 
-        // If the cast fails then the allocation is fully consumed and does not
-        // flow any further (instead, we trap).
-        if (!Type::isSubType(allocation->type, curr->type)) {
+        if (curr->ref == child) {
+          // If the cast fails then the allocation is fully consumed and does
+          // not flow any further (instead, we trap).
+          if (!Type::isSubType(allocation->type, curr->type)) {
+            fullyConsumes = true;
+          }
+        } else {
+          // Either the child is the descriptor, in which case we consume it, or
+          // we have already optimized this ref.cast_desc for an allocation that
+          // flowed through as its `ref`. In the latter case the current child
+          // must have originally been the descriptor, so we can still say it's
+          // fully consumed, but we cannot assert that curr->desc == child.
           fullyConsumes = true;
         }
+      }
+
+      void visitRefGetDesc(RefGetDesc* curr) {
+        escapes = false;
+        fullyConsumes = true;
       }
 
       // GC operations.
@@ -447,6 +460,18 @@ struct EscapeAnalyzer {
         }
         escapes = false;
         fullyConsumes = true;
+      }
+      void visitArrayRMW(ArrayRMW* curr) {
+        if (curr->ref == child) {
+          escapes = false;
+          fullyConsumes = true;
+        }
+      }
+      void visitArrayCmpxchg(ArrayCmpxchg* curr) {
+        if (curr->ref == child || curr->expected == child) {
+          escapes = false;
+          fullyConsumes = true;
+        }
       }
       // TODO other GC operations
     } checker;
@@ -579,6 +604,10 @@ struct Struct2Local : PostWalker<Struct2Local> {
   Builder builder;
   const FieldList& fields;
 
+  // The descriptor can arrive as nullable, but we trap if it is null, so there
+  // is only something to store if it is non-nullable, and we store it that way.
+  Type descType;
+
   Struct2Local(StructNew* allocation,
                EscapeAnalyzer& analyzer,
                Function* func,
@@ -586,9 +615,13 @@ struct Struct2Local : PostWalker<Struct2Local> {
     : allocation(allocation), analyzer(analyzer), func(func), wasm(wasm),
       builder(wasm), fields(allocation->type.getHeapType().getStruct().fields) {
 
-    // Allocate locals to store the allocation's fields in.
+    // Allocate locals to store the allocation's fields and descriptor in.
     for (auto field : fields) {
       localIndexes.push_back(builder.addVar(func, field.type));
+    }
+    if (allocation->desc) {
+      descType = allocation->desc->type.with(NonNullable);
+      localIndexes.push_back(builder.addVar(func, descType));
     }
 
     // Replace the things we need to using the visit* methods.
@@ -696,61 +729,58 @@ struct Struct2Local : PostWalker<Struct2Local> {
     // First, assign the initial values to the new locals.
     std::vector<Expression*> contents;
 
-    if (!allocation->isWithDefault()) {
-      // We must assign the initial values to temp indexes, then copy them
-      // over all at once. If instead we did set them as we go, then we might
-      // hit a problem like this:
-      //
-      //  (local.set X (new_X))
-      //  (local.set Y (block (result ..)
-      //                 (.. (local.get X) ..) ;; returns new_X, wrongly
-      //                 (new_Y)
-      //               )
-      //
-      // Note how we assign to the local X and use it during the assignment to
-      // the local Y - but we should still see the old value of X, not new_X.
-      // Temp locals X', Y' can ensure that:
-      //
-      //  (local.set X' (new_X))
-      //  (local.set Y' (block (result ..)
-      //                  (.. (local.get X) ..) ;; returns the proper, old X
-      //                  (new_Y)
-      //                )
-      //  ..
-      //  (local.set X (local.get X'))
-      //  (local.set Y (local.get Y'))
-      std::vector<Index> tempIndexes;
+    // We might be in a loop, so the locals representing the struct fields might
+    // already have values. Furthermore, the computation of the new field values
+    // might depend on the old field values. If we naively assign the new values
+    // to the locals as they are computed, the computation of a later field may
+    // use the new value of an earlier field where it should have used the old
+    // value of the earlier field. To avoid this problem, we store all the
+    // nontrivial new values in temp locals, and only once they have fully been
+    // computed do we copy them into the locals representing the fields.
+    std::vector<Index> tempIndexes;
+    Index numTemps =
+      (curr->isWithDefault() ? 0 : fields.size()) + bool(curr->desc);
+    tempIndexes.reserve(numTemps);
 
+    // Create the temp variables.
+    if (!curr->isWithDefault()) {
       for (auto field : fields) {
         tempIndexes.push_back(builder.addVar(func, field.type));
       }
+    }
+    if (curr->desc) {
+      tempIndexes.push_back(builder.addVar(func, descType));
+    }
 
-      // Store the initial values into the temp locals.
-      for (Index i = 0; i < tempIndexes.size(); i++) {
+    // Store the initial values into the temp locals.
+    if (!curr->isWithDefault()) {
+      for (Index i = 0; i < fields.size(); i++) {
         contents.push_back(
-          builder.makeLocalSet(tempIndexes[i], allocation->operands[i]));
+          builder.makeLocalSet(tempIndexes[i], curr->operands[i]));
       }
+    }
+    if (curr->desc) {
+      // Preserve the trapping on null descriptors by inserting a
+      // ref.as_non_null.
+      Expression* desc = curr->desc;
+      if (curr->desc->type.isNullable()) {
+        desc = builder.makeRefAs(RefAsNonNull, desc);
+      }
+      contents.push_back(builder.makeLocalSet(tempIndexes[numTemps - 1], desc));
+    }
 
-      // Copy them to the normal ones.
-      for (Index i = 0; i < tempIndexes.size(); i++) {
-        auto* value = builder.makeLocalGet(tempIndexes[i], fields[i].type);
-        contents.push_back(builder.makeLocalSet(localIndexes[i], value));
-      }
-
-      // TODO Check if the nondefault case does not increase code size in some
-      //      cases. A heap allocation that implicitly sets the default values
-      //      is smaller than multiple explicit settings of locals to
-      //      defaults.
-    } else {
-      // Set the default values.
-      //
-      // Note that we must assign the defaults because we might be in a loop,
-      // that is, there might be a previous value.
-      for (Index i = 0; i < localIndexes.size(); i++) {
-        contents.push_back(builder.makeLocalSet(
-          localIndexes[i],
-          builder.makeConstantExpression(Literal::makeZero(fields[i].type))));
-      }
+    // Store the values into the locals representing the fields.
+    for (Index i = 0; i < fields.size(); ++i) {
+      auto* val =
+        curr->isWithDefault()
+          ? builder.makeConstantExpression(Literal::makeZero(fields[i].type))
+          : builder.makeLocalGet(tempIndexes[i], fields[i].type);
+      contents.push_back(builder.makeLocalSet(localIndexes[i], val));
+    }
+    if (curr->desc) {
+      auto* val = builder.makeLocalGet(tempIndexes[numTemps - 1], descType);
+      contents.push_back(
+        builder.makeLocalSet(localIndexes[fields.size()], val));
     }
 
     // Replace the allocation with a null reference. This changes the type
@@ -762,6 +792,12 @@ struct Struct2Local : PostWalker<Struct2Local> {
 
   void visitRefIsNull(RefIsNull* curr) {
     if (analyzer.getInteraction(curr) == ParentChildInteraction::None) {
+      return;
+    }
+
+    if (curr->type == Type::unreachable) {
+      // The result does not matter. Leave things as they are (and let DCE
+      // handle it).
       return;
     }
 
@@ -826,22 +862,108 @@ struct Struct2Local : PostWalker<Struct2Local> {
       return;
     }
 
-    // We know this RefCast receives our allocation, so we can see whether it
-    // succeeds or fails.
-    if (Type::isSubType(allocation->type, curr->type)) {
-      // The cast succeeds, so it is a no-op, and we can skip it, since after we
-      // remove the allocation it will not even be needed for validation.
-      replaceCurrent(curr->ref);
+    if (curr->desc) {
+      auto descTrap = [&]() {
+        replaceCurrent(builder.blockify(builder.makeDrop(curr->ref),
+                                        builder.makeDrop(curr->desc),
+                                        builder.makeUnreachable()));
+      };
+
+      // If we are doing a ref.cast_desc of the optimized allocation, but the
+      // allocation does not have a descriptor, then we know the cast must fail.
+      // We also know the cast must fail (except for nulls it might let through)
+      // if the optimized allocation flows in as the descriptor, since it cannot
+      // possibly have been used in the allocation of the cast value without
+      // having been considered to escape.
+      bool allocIsCastRef =
+        analyzer.getInteraction(curr->ref) == ParentChildInteraction::Flows;
+      bool allocIsCastDesc =
+        analyzer.getInteraction(curr->desc) == ParentChildInteraction::Flows;
+      if (!allocation->desc || allocIsCastDesc) {
+        // It would seem convenient to use ChildLocalizer here, but we cannot.
+        // ChildLocalizer would create a local.set for a desc operand with
+        // side effects, but that local.set would not be reflected in the parent
+        // map, so it would not be updated if the allocation flowing through
+        // that desc operand were later optimized.
+        if (allocIsCastDesc && !allocIsCastRef && curr->type.isNullable()) {
+          // There might be a null value to let through. Reuse curr as a cast to
+          // null. Use a scratch local to move the reference value past the desc
+          // value.
+          Index scratch = builder.addVar(func, curr->ref->type);
+          replaceCurrent(
+            builder.blockify(builder.makeLocalSet(scratch, curr->ref),
+                             builder.makeDrop(curr->desc),
+                             curr));
+          curr->desc = nullptr;
+          curr->type = curr->type.with(curr->type.getHeapType().getBottom());
+          curr->ref = builder.makeLocalGet(scratch, curr->ref->type);
+        } else {
+          // Either the cast does not allow nulls or we know the value isn't
+          // null anyway, so the cast certainly fails.
+          descTrap();
+        }
+      } else if (allocIsCastRef) {
+        if (!Type::isSubType(allocation->type, curr->type)) {
+          // The cast fails, so it must trap. We mark such failing casts as
+          // fully consuming their inputs, so we cannot just emit the explicit
+          // descriptor equality check below because it would appear to be able
+          // to propagate the optimized allocation on to the parent (as a null
+          // value, which might not validate).
+          descTrap();
+        } else {
+          // The cast succeeds iff the optimized allocation's descriptor is the
+          // same as the given descriptor and traps otherwise.
+          replaceCurrent(builder.blockify(
+            builder.makeDrop(curr->ref),
+            builder.makeIf(
+              builder.makeRefEq(
+                curr->desc,
+                builder.makeLocalGet(localIndexes[fields.size()], descType)),
+              builder.makeRefNull(allocation->type.getHeapType()),
+              builder.makeUnreachable())));
+        }
+      } else {
+        // The allocation is neither the ref nor the descriptor inputs to this
+        // cast. This can happen if a previous operation led to the StructNew
+        // being dropped, as a result if it being used in unreachable code (it
+        // ends up happening because some of the initial analysis, like Parents,
+        // is stale; we could also recompute Parents after each Struct2Local,
+        // but it is simple enough to handle this with a trap).
+        assert(curr->type == Type::unreachable);
+        descTrap();
+      }
     } else {
-      // The cast fails, so this must trap.
-      replaceCurrent(builder.makeSequence(builder.makeDrop(curr->ref),
-                                          builder.makeUnreachable()));
+      // We know this RefCast receives our allocation, so we can see whether it
+      // succeeds or fails.
+      if (Type::isSubType(allocation->type, curr->type)) {
+        // The cast succeeds, so it is a no-op, and we can skip it, since after
+        // we remove the allocation it will not even be needed for validation.
+        replaceCurrent(curr->ref);
+      } else {
+        // The cast fails, so this must trap.
+        replaceCurrent(builder.makeSequence(builder.makeDrop(curr->ref),
+                                            builder.makeUnreachable()));
+      }
     }
 
-    // Either way, we need to refinalize here (we either added an unreachable,
+    // In any case, we need to refinalize here (we either added an unreachable,
     // or we replaced a cast with the value being cast, which may have a less-
     // refined type - it will not be used after we remove the allocation, but we
     // must still fix that up for validation).
+    refinalize = true;
+  }
+
+  void visitRefGetDesc(RefGetDesc* curr) {
+    if (analyzer.getInteraction(curr) == ParentChildInteraction::None) {
+      return;
+    }
+
+    auto descIndex = localIndexes[fields.size()];
+    Expression* value = builder.makeLocalGet(descIndex, descType);
+    replaceCurrent(builder.blockify(builder.makeDrop(curr->ref), value));
+
+    // After removing the ref.get_desc, a null may be falling through,
+    // requiring refinalization to update parents.
     refinalize = true;
   }
 
@@ -864,6 +986,15 @@ struct Struct2Local : PostWalker<Struct2Local> {
 
   void visitStructGet(StructGet* curr) {
     if (analyzer.getInteraction(curr) == ParentChildInteraction::None) {
+      return;
+    }
+
+    if (curr->type == Type::unreachable) {
+      // We must not modify unreachable code here, as we will replace it with a
+      // local.get, which has a concrete type (another option could be to run
+      // DCE and not only ReFinalize - DCE will propagate an unreachable out of
+      // a concrete block, like we emit here - but we can just ignore such
+      // code).
       return;
     }
 
@@ -1029,8 +1160,7 @@ struct Array2Struct : PostWalker<Array2Struct> {
 
   // The type of the struct we are changing to (nullable and non-nullable
   // variations).
-  Type nullStruct;
-  Type nonNullStruct;
+  HeapType structType;
 
   Array2Struct(Expression* allocation,
                EscapeAnalyzer& analyzer,
@@ -1048,7 +1178,7 @@ struct Array2Struct : PostWalker<Array2Struct> {
     for (Index i = 0; i < numFields; i++) {
       fields.push_back(element);
     }
-    HeapType structType = Struct(fields);
+    structType = Struct(fields);
 
     // Generate a StructNew to replace the ArrayNew*.
     if (auto* arrayNew = allocation->dynCast<ArrayNew>()) {
@@ -1097,10 +1227,6 @@ struct Array2Struct : PostWalker<Array2Struct> {
     // the array type (which can be the case of an array of arrays). But that is
     // fine to do as the array.get is rewritten to a struct.get which is then
     // lowered away to locals anyhow.
-    auto nullArray = Type(arrayType, Nullable);
-    auto nonNullArray = Type(arrayType, NonNullable);
-    nullStruct = Type(structType, Nullable);
-    nonNullStruct = Type(structType, NonNullable);
     for (auto& [reached, _] : analyzer.reachedInteractions) {
       if (reached->is<RefCast>()) {
         // Casts must be handled later: We need to see the old type, and to
@@ -1108,19 +1234,18 @@ struct Array2Struct : PostWalker<Array2Struct> {
         continue;
       }
 
-      // We must check subtyping here because the allocation may be upcast as it
-      // flows around. If we do see such upcasting then we are refining here and
-      // must refinalize.
-      if (Type::isSubType(nullArray, reached->type)) {
-        if (nullArray != reached->type) {
+      if (!reached->type.isRef()) {
+        continue;
+      }
+
+      // The allocation type may be generalized as it flows around. If we do see
+      // such generalizing, then we are refining here and must refinalize.
+      auto reachedHeapType = reached->type.getHeapType();
+      if (HeapType::isSubType(arrayType, reachedHeapType)) {
+        if (arrayType != reachedHeapType) {
           refinalize = true;
         }
-        reached->type = nullStruct;
-      } else if (Type::isSubType(nonNullArray, reached->type)) {
-        if (nonNullArray != reached->type) {
-          refinalize = true;
-        }
-        reached->type = nonNullStruct;
+        reached->type = Type(structType, reached->type.getNullability());
       }
     }
 
@@ -1248,7 +1373,7 @@ struct Array2Struct : PostWalker<Array2Struct> {
       // type here unconditionally, since we know the allocation flows through
       // here, and anyhow we will be removing the reference during Struct2Local,
       // later.)
-      curr->type = nonNullStruct;
+      curr->type = Type(structType, NonNullable);
     }
 
     // Regardless of how we altered the type here, refinalize.

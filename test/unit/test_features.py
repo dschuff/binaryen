@@ -1,6 +1,7 @@
 import os
 
 from scripts.test import shared
+
 from . import utils
 
 
@@ -451,4 +452,6 @@ class TargetFeaturesSectionTest(utils.BinaryenTestCase):
             '--enable-shared-everything',
             '--enable-fp16',
             '--enable-bulk-memory-opt',
+            '--enable-call-indirect-overlong',
+            '--enable-custom-descriptors',
         ], p2.stdout.splitlines())

@@ -444,7 +444,7 @@
   ;; CHECK-NEXT:  (local $1 f64)
   ;; CHECK-NEXT:  (local $2 (ref any))
   ;; CHECK-NEXT:  (drop
-  ;; CHECK-NEXT:   (block (result (ref $struct))
+  ;; CHECK-NEXT:   (block (result (ref (exact $struct)))
   ;; CHECK-NEXT:    (local.set $0
   ;; CHECK-NEXT:     (call $helper0
   ;; CHECK-NEXT:      (i32.const 0)
@@ -484,7 +484,7 @@
   ;; CHECK-NEXT:  (local $0 f64)
   ;; CHECK-NEXT:  (local $1 (ref any))
   ;; CHECK-NEXT:  (drop
-  ;; CHECK-NEXT:   (block (result (ref $struct))
+  ;; CHECK-NEXT:   (block (result (ref (exact $struct)))
   ;; CHECK-NEXT:    (local.set $0
   ;; CHECK-NEXT:     (call $helper1
   ;; CHECK-NEXT:      (i32.const 0)
@@ -520,7 +520,7 @@
   ;; CHECK-NEXT:  (local $1 f64)
   ;; CHECK-NEXT:  (local $2 (ref any))
   ;; CHECK-NEXT:  (drop
-  ;; CHECK-NEXT:   (block (result (ref $struct))
+  ;; CHECK-NEXT:   (block (result (ref (exact $struct)))
   ;; CHECK-NEXT:    (local.set $0
   ;; CHECK-NEXT:     (global.get $mut-i32)
   ;; CHECK-NEXT:    )
@@ -585,7 +585,7 @@
   ;; CHECK:      (func $new-side-effect-in-kept (type $3) (param $any (ref any))
   ;; CHECK-NEXT:  (local $1 i32)
   ;; CHECK-NEXT:  (drop
-  ;; CHECK-NEXT:   (block (result (ref $struct))
+  ;; CHECK-NEXT:   (block (result (ref (exact $struct)))
   ;; CHECK-NEXT:    (local.set $1
   ;; CHECK-NEXT:     (call $helper0
   ;; CHECK-NEXT:      (i32.const 0)
@@ -1651,7 +1651,7 @@
   ;; CHECK-NEXT:     (pop i32)
   ;; CHECK-NEXT:    )
   ;; CHECK-NEXT:    (drop
-  ;; CHECK-NEXT:     (block (result (ref $struct))
+  ;; CHECK-NEXT:     (block (result (ref (exact $struct)))
   ;; CHECK-NEXT:      (local.set $0
   ;; CHECK-NEXT:       (local.get $1)
   ;; CHECK-NEXT:      )
@@ -1675,3 +1675,45 @@
     )
   )
 )
+
+(module
+  ;; A struct with partial names: only some fields are named. We should still
+  ;; update names properly when removing and reordering.
+
+  ;; CHECK:      (rec
+  ;; CHECK-NEXT:  (type $struct (sub (struct (field (mut i32)) (field $named (mut i32)))))
+  (type $struct (sub (struct (field (mut i32)) (field (mut i32)) (field $named (mut i32)) (field (mut i32)) (field (mut i32)))))
+
+  ;; CHECK:       (type $1 (func (param (ref $struct))))
+
+  ;; CHECK:      (func $func (type $1) (param $x (ref $struct))
+  ;; CHECK-NEXT:  (struct.set $struct 0
+  ;; CHECK-NEXT:   (local.get $x)
+  ;; CHECK-NEXT:   (struct.get $struct 0
+  ;; CHECK-NEXT:    (local.get $x)
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT:  (struct.set $struct $named
+  ;; CHECK-NEXT:   (local.get $x)
+  ;; CHECK-NEXT:   (struct.get $struct $named
+  ;; CHECK-NEXT:    (local.get $x)
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT: )
+  (func $func (param $x (ref $struct))
+    ;; Use fields 1 and 2.
+    (struct.set $struct 1
+      (local.get $x)
+      (struct.get $struct 1
+        (local.get $x)
+      )
+    )
+    (struct.set $struct 2
+      (local.get $x)
+      (struct.get $struct 2
+        (local.get $x)
+      )
+    )
+  )
+)
+

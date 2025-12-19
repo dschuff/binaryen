@@ -14,18 +14,18 @@
  * limitations under the License.
  */
 
-#include "literal.h"
-
 #include <cassert>
 #include <cmath>
 
 #include "emscripten-optimizer/simple_ast.h"
 #include "fp16.h"
 #include "ir/bits.h"
+#include "literal.h"
 #include "pretty_printing.h"
 #include "support/bits.h"
 #include "support/string.h"
 #include "support/utilities.h"
+#include "wasm-interpreter.h"
 
 namespace wasm {
 
@@ -53,7 +53,7 @@ Literal::Literal(Type type) : type(type) {
   }
 
   if (type.isNull()) {
-    assert(type.isNullable());
+    assert(type.isNullable() && !type.isExact());
     new (&gcData) std::shared_ptr<GCData>();
     return;
   }
@@ -71,8 +71,25 @@ Literal::Literal(const uint8_t init[16]) : type(Type::v128) {
   memcpy(&v128, init, 16);
 }
 
+Literal::Literal(std::shared_ptr<FuncData> funcData, Type type)
+  : funcData(funcData), type(type) {
+  assert(funcData);
+  assert(type.isSignature());
+}
+
+Literal Literal::makeFunc(Name func, Type type) {
+  // Provide only the name of the function, without execution info.
+  return Literal(std::make_shared<FuncData>(func), type);
+}
+
+Literal Literal::makeFunc(Name func, Module& wasm) {
+  return makeFunc(func, wasm.getFunction(func)->type);
+}
+
 Literal::Literal(std::shared_ptr<GCData> gcData, HeapType type)
-  : gcData(gcData), type(type, gcData ? NonNullable : Nullable) {
+  : gcData(gcData), type(type,
+                         gcData ? NonNullable : Nullable,
+                         gcData && !type.isBasic() ? Exact : Inexact) {
   // The type must be a proper type for GC data: either a struct, array, or
   // string; or an externalized version of the same; or a null; or an
   // internalized string (which appears as an anyref).
@@ -88,6 +105,9 @@ Literal::Literal(std::shared_ptr<ExnData> exnData)
   // The data must not be null.
   assert(exnData);
 }
+
+Literal::Literal(std::shared_ptr<ContData> contData)
+  : contData(contData), type(contData->type, NonNullable, Exact) {}
 
 Literal::Literal(std::string_view string)
   : gcData(nullptr), type(Type(HeapType::string, NonNullable)) {
@@ -135,7 +155,11 @@ Literal::Literal(const Literal& other) : type(other.type) {
     return;
   }
   if (type.isFunction()) {
-    func = other.func;
+    new (&funcData) std::shared_ptr<FuncData>(other.funcData);
+    return;
+  }
+  if (type.isContinuation()) {
+    new (&contData) std::shared_ptr<ContData>(other.contData);
     return;
   }
   switch (heapType.getBasic(Unshared)) {
@@ -178,8 +202,12 @@ Literal::~Literal() {
   if (isNull() || isData() || type.getHeapType().isMaybeShared(HeapType::ext) ||
       type.getHeapType().isMaybeShared(HeapType::any)) {
     gcData.~shared_ptr();
+  } else if (isFunction()) {
+    funcData.~shared_ptr();
   } else if (isExn()) {
     exnData.~shared_ptr();
+  } else if (isContinuation()) {
+    contData.~shared_ptr();
   }
 }
 
@@ -324,6 +352,16 @@ std::array<uint8_t, 16> Literal::getv128() const {
   return ret;
 }
 
+Name Literal::getFunc() const {
+  assert(isFunction());
+  return getFuncData()->name;
+}
+
+std::shared_ptr<FuncData> Literal::getFuncData() const {
+  assert(isFunction());
+  return funcData;
+}
+
 std::shared_ptr<GCData> Literal::getGCData() const {
   assert(isNull() || isData());
   return gcData;
@@ -333,6 +371,12 @@ std::shared_ptr<ExnData> Literal::getExnData() const {
   assert(isExn());
   assert(exnData);
   return exnData;
+}
+
+std::shared_ptr<ContData> Literal::getContData() const {
+  assert(isContinuation());
+  assert(contData);
+  return contData;
 }
 
 Literal Literal::castToF32() {
@@ -441,8 +485,7 @@ bool Literal::operator==(const Literal& other) const {
       return true;
     }
     if (type.isFunction()) {
-      assert(func.is() && other.func.is());
-      return func == other.func;
+      return *funcData == *other.funcData;
     }
     if (type.isString()) {
       return gcData->values == other.gcData->values;
@@ -450,12 +493,16 @@ bool Literal::operator==(const Literal& other) const {
     if (type.isData()) {
       return gcData == other.gcData;
     }
-    assert(type.getHeapType().isBasic());
-    if (type.getHeapType().isMaybeShared(HeapType::i31)) {
+    auto heapType = type.getHeapType();
+    assert(heapType.isBasic());
+    if (heapType.isMaybeShared(HeapType::i31)) {
       return i32 == other.i32;
     }
-    if (type.getHeapType().isMaybeShared(HeapType::ext)) {
+    if (heapType.isMaybeShared(HeapType::ext)) {
       return internalize() == other.internalize();
+    }
+    if (heapType.isMaybeShared(HeapType::any)) {
+      return externalize() == other.externalize();
     }
     WASM_UNREACHABLE("unexpected type");
   }
@@ -692,6 +739,19 @@ std::ostream& operator<<(std::ostream& o, Literal literal) {
       }
     } else if (heapType.isSignature()) {
       o << "funcref(" << literal.getFunc() << ")";
+    } else if (heapType.isContinuation()) {
+      auto data = literal.getContData();
+      o << "cont(" << data->func << ' ' << data->type;
+      if (data->resumeExpr) {
+        o << " resumeExpr=" << reinterpret_cast<size_t>(data->resumeExpr);
+      }
+      if (!data->resumeInfo.empty()) {
+        o << " |resumeInfo|=" << data->resumeInfo.size();
+      }
+      if (!data->resumeArguments.empty()) {
+        o << " resumeArguments=" << data->resumeArguments;
+      }
+      o << " executed=" << data->executed << ')';
     } else {
       assert(literal.isData());
       auto data = literal.getGCData();
@@ -2601,6 +2661,21 @@ Literal Literal::dotUI8x16toI16x8(const Literal& other) const {
 }
 Literal Literal::dotSI16x8toI32x4(const Literal& other) const {
   return dot<4, 2, &Literal::getLanesSI16x8>(*this, other);
+}
+
+Literal Literal::dotSI8x16toI16x8Add(const Literal& left,
+                                     const Literal& right) const {
+  auto temp = dotSI8x16toI16x8(left);
+
+  auto tempLanes = temp.getLanesSI16x8();
+  LaneArray<4> dest;
+  // TODO: the index on dest may be wrong, see
+  //       https://github.com/WebAssembly/relaxed-simd/issues/162
+  for (size_t i = 0; i < 4; i++) {
+    dest[i] = tempLanes[i * 2].add(tempLanes[i * 2 + 1]);
+  }
+
+  return Literal(dest).addI32x4(right);
 }
 
 Literal Literal::bitselectV128(const Literal& left,

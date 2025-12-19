@@ -229,7 +229,7 @@
  ;; CHECK-NEXT:     (struct.new_default $sub)
  ;; CHECK-NEXT:    )
  ;; CHECK-NEXT:    (drop
- ;; CHECK-NEXT:     (block $other (result (ref $opt))
+ ;; CHECK-NEXT:     (block $other (result (ref (exact $opt)))
  ;; CHECK-NEXT:      (br $other
  ;; CHECK-NEXT:       (struct.new_default $opt)
  ;; CHECK-NEXT:      )
@@ -271,7 +271,7 @@
 
  ;; CHECK:      (func $if (type $2)
  ;; CHECK-NEXT:  (drop
- ;; CHECK-NEXT:   (if (result (ref $sub))
+ ;; CHECK-NEXT:   (if (result (ref (exact $sub)))
  ;; CHECK-NEXT:    (i32.const 0)
  ;; CHECK-NEXT:    (then
  ;; CHECK-NEXT:     (struct.new_default $sub)
@@ -309,7 +309,7 @@
 
  ;; CHECK:      (func $loop (type $2)
  ;; CHECK-NEXT:  (drop
- ;; CHECK-NEXT:   (loop (result (ref $sub))
+ ;; CHECK-NEXT:   (loop (result (ref (exact $sub)))
  ;; CHECK-NEXT:    (struct.new_default $sub)
  ;; CHECK-NEXT:   )
  ;; CHECK-NEXT:  )
@@ -335,9 +335,9 @@
 
  ;; CHECK:      (func $loop (type $2)
  ;; CHECK-NEXT:  (drop
- ;; CHECK-NEXT:   (block $super (result (ref $sub))
+ ;; CHECK-NEXT:   (block $super (result (ref (exact $sub)))
  ;; CHECK-NEXT:    (drop
- ;; CHECK-NEXT:     (block $sub (result (ref $sub))
+ ;; CHECK-NEXT:     (block $sub (result (ref (exact $sub)))
  ;; CHECK-NEXT:      (br_table $super $sub
  ;; CHECK-NEXT:       (struct.new_default $sub)
  ;; CHECK-NEXT:       (i32.const 0)
@@ -377,9 +377,9 @@
 
  ;; CHECK:      (func $br-table (type $2)
  ;; CHECK-NEXT:  (drop
- ;; CHECK-NEXT:   (block $super (result (ref $sub))
+ ;; CHECK-NEXT:   (block $super (result (ref (exact $sub)))
  ;; CHECK-NEXT:    (drop
- ;; CHECK-NEXT:     (block $sub (result (ref $sub))
+ ;; CHECK-NEXT:     (block $sub (result (ref (exact $sub)))
  ;; CHECK-NEXT:      (br_table $sub $super
  ;; CHECK-NEXT:       (struct.new_default $sub)
  ;; CHECK-NEXT:       (i32.const 0)
@@ -1067,15 +1067,14 @@
  ;; CHECK:      (rec
  ;; CHECK-NEXT:  (type $super (sub (struct)))
  (type $super (sub (struct)))
- ;; CHECK:       (type $sub (sub $super (struct)))
  (type $sub (sub $super (struct)))
 
- ;; CHECK:       (type $2 (func))
+ ;; CHECK:       (type $1 (func))
 
- ;; CHECK:      (func $br-on-cast (type $2)
+ ;; CHECK:      (func $br-on-cast (type $1)
  ;; CHECK-NEXT:  (drop
- ;; CHECK-NEXT:   (block $l (result (ref $super))
- ;; CHECK-NEXT:    (br_on_cast $l (ref $super) (ref $sub)
+ ;; CHECK-NEXT:   (block $l (result (ref (exact $super)))
+ ;; CHECK-NEXT:    (br_on_cast $l (ref (exact $super)) (ref none)
  ;; CHECK-NEXT:     (struct.new_default $super)
  ;; CHECK-NEXT:    )
  ;; CHECK-NEXT:   )
@@ -1104,8 +1103,8 @@
 
  ;; CHECK:      (func $br-on-cast-fail (type $2)
  ;; CHECK-NEXT:  (drop
- ;; CHECK-NEXT:   (block $l (result (ref $sub))
- ;; CHECK-NEXT:    (br_on_cast_fail $l (ref $sub) (ref none)
+ ;; CHECK-NEXT:   (block $l (result (ref (exact $sub)))
+ ;; CHECK-NEXT:    (br_on_cast_fail $l (ref (exact $sub)) (ref none)
  ;; CHECK-NEXT:     (struct.new_default $sub)
  ;; CHECK-NEXT:    )
  ;; CHECK-NEXT:   )
@@ -1850,4 +1849,201 @@
    )
   )
  )
+)
+
+;; Regression test for assertion failure on incorrect updating of type tree
+;; state.
+(module
+ (rec
+  ;; CHECK:      (rec
+  ;; CHECK-NEXT:  (type $0 (sub (struct)))
+  (type $0 (sub (struct)))
+  ;; CHECK:       (type $1 (sub $0 (struct (field (ref null $0)))))
+  (type $1 (sub $0 (struct (field (ref null $0)))))
+  ;; CHECK:       (type $2 (sub $1 (struct (field (ref null $3)))))
+  (type $2 (sub $1 (struct (field (ref null $3)))))
+  ;; CHECK:       (type $3 (sub $0 (struct)))
+  (type $3 (sub $0 (struct)))
+ )
+ ;; CHECK:      (global $g (ref struct) (struct.new_default $2))
+ (global $g (ref struct) (struct.new_default $2))
+ ;; CHECK:      (global $g2 (ref null $1) (ref.null none))
+ (global $g2 (ref null $1) (ref.null none))
+ ;; CHECK:      (export "" (global $g2))
+ (export "" (global $g2))
+)
+
+;; Regression for a mishandling of shared i31 with i31.get.
+(module
+ ;; CHECK:      (type $0 (func (result i32)))
+
+ ;; CHECK:      (func $i31-get (type $0) (result i32)
+ ;; CHECK-NEXT:  (i31.get_s
+ ;; CHECK-NEXT:   (ref.i31_shared
+ ;; CHECK-NEXT:    (i32.const 0)
+ ;; CHECK-NEXT:   )
+ ;; CHECK-NEXT:  )
+ ;; CHECK-NEXT: )
+ (func $i31-get (result i32)
+  (i31.get_s
+   (ref.i31_shared
+    (i32.const 0)
+   )
+  )
+ )
+)
+
+;; Even though our analysis has its own visitor for StructNew, it should still
+;; be able to collect subtype constraints from StructNews.
+(module
+  ;; CHECK:      (rec
+  ;; CHECK-NEXT:  (type $A (sub (struct (field (ref null $A)))))
+  (type $A (sub (struct (field (ref null $A)))))
+  ;; CHECK:       (type $B (sub $A (struct (field (ref null $A)))))
+  (type $B (sub $A (struct (field (ref null $A)))))
+
+  ;; CHECK:       (type $2 (func (param (ref null $B))))
+
+  ;; CHECK:      (func $test (type $2) (param $B (ref null $B))
+  ;; CHECK-NEXT:  (drop
+  ;; CHECK-NEXT:   (struct.new $A
+  ;; CHECK-NEXT:    (local.get $B)
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT: )
+  (func $test (param $B (ref null $B))
+    (drop
+      ;; This requires B <: A.
+      (struct.new $A
+        (local.get $B)
+      )
+    )
+  )
+)
+
+;; extern.convert_any requires its input to remain a subtype of any.
+(module
+  ;; CHECK:      (rec
+  ;; CHECK-NEXT:  (type $A (sub (struct)))
+  (type $A (sub (struct)))
+  ;; CHECK:       (type $B (sub $A (struct)))
+  (type $B (sub $A (struct)))
+
+  ;; CHECK:       (type $2 (func (result externref)))
+
+  ;; CHECK:       (type $3 (func (param anyref)))
+
+  ;; CHECK:      (func $test (type $2) (result externref)
+  ;; CHECK-NEXT:  (extern.convert_any
+  ;; CHECK-NEXT:   (struct.new_default $B)
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT: )
+  (func $test (result externref)
+    (extern.convert_any
+      (struct.new $B)
+    )
+  )
+
+  ;; CHECK:      (func $cast (type $3) (param $0 anyref)
+  ;; CHECK-NEXT:  (drop
+  ;; CHECK-NEXT:   (ref.cast (ref null $A)
+  ;; CHECK-NEXT:    (local.get $0)
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT: )
+  (func $cast (param anyref)
+    (drop
+      ;; Since $B flows into any, it must remain a subtype of $A to continue
+      ;; passing this cast.
+      (ref.cast (ref null $A)
+        (local.get 0)
+      )
+    )
+  )
+)
+
+;; Same as above with shared types.
+(module
+  ;; CHECK:      (rec
+  ;; CHECK-NEXT:  (type $A (sub (shared (struct))))
+  (type $A (sub (shared (struct))))
+  ;; CHECK:       (type $B (sub $A (shared (struct))))
+  (type $B (sub $A (shared (struct))))
+
+  ;; CHECK:       (type $2 (func (result (ref null (shared extern)))))
+
+  ;; CHECK:       (type $3 (func (param (ref null (shared any)))))
+
+  ;; CHECK:      (func $test (type $2) (result (ref null (shared extern)))
+  ;; CHECK-NEXT:  (extern.convert_any
+  ;; CHECK-NEXT:   (struct.new_default $B)
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT: )
+  (func $test (result (ref null (shared extern)))
+    (extern.convert_any
+      (struct.new $B)
+    )
+  )
+
+  ;; CHECK:      (func $cast (type $3) (param $0 (ref null (shared any)))
+  ;; CHECK-NEXT:  (drop
+  ;; CHECK-NEXT:   (ref.cast (ref null $A)
+  ;; CHECK-NEXT:    (local.get $0)
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT: )
+  (func $cast (param (ref null (shared any)))
+    (drop
+      ;; Since $B flows into any, it must remain a subtype of $A to continue
+      ;; passing this cast.
+      (ref.cast (ref null $A)
+        (local.get 0)
+      )
+    )
+  )
+)
+
+;; Regression test for an assertion failure when br_if has a tuple value and
+;; unreachable condition.
+(module
+  ;; CHECK:      (rec
+  ;; CHECK-NEXT:  (type $A (sub (struct)))
+  (type $A (sub (struct)))
+  ;; CHECK:       (type $B (sub (struct)))
+  (type $B (sub $A (struct)))
+  ;; CHECK:       (type $C (sub $A (struct)))
+  (type $C (sub $B (struct)))
+  ;; CHECK:       (type $3 (func (param (ref $C)) (result (ref $A) (ref $A))))
+
+  ;; CHECK:      (func $test (type $3) (param $C (ref $C)) (result (ref $A) (ref $A))
+  ;; CHECK-NEXT:  (local $Bs (tuple (ref $B) (ref $B)))
+  ;; CHECK-NEXT:  (block $l
+  ;; CHECK-NEXT:   (local.tee $Bs
+  ;; CHECK-NEXT:    (block
+  ;; CHECK-NEXT:     (tuple.drop 2
+  ;; CHECK-NEXT:      (tuple.make 2
+  ;; CHECK-NEXT:       (local.get $C)
+  ;; CHECK-NEXT:       (local.get $C)
+  ;; CHECK-NEXT:      )
+  ;; CHECK-NEXT:     )
+  ;; CHECK-NEXT:     (unreachable)
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT: )
+  (func $test (param $C (ref $C)) (result (ref $A) (ref $A))
+    (local $Bs (tuple (ref $B) (ref $B)))
+    (block $l (result (ref $A) (ref $A))
+      (local.set $Bs
+        ;; Because the br_if is unreachable, we do not record $C <: $B.
+        (br_if $l
+          (tuple.make 2
+            (local.get $C)
+            (local.get $C)
+          )
+          (unreachable)
+        )
+      )
+    )
+  )
 )

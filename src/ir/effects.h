@@ -643,6 +643,11 @@ private:
       parent.writesMemory = true;
       parent.isAtomic = true;
     }
+    void visitPause(Pause* curr) {
+      // It's not much of a problem if pause gets reordered with anything, but
+      // we don't want it to be removed entirely.
+      parent.isAtomic = true;
+    }
     void visitSIMDExtract(SIMDExtract* curr) {}
     void visitSIMDReplace(SIMDReplace* curr) {}
     void visitSIMDShuffle(SIMDShuffle* curr) {}
@@ -782,6 +787,7 @@ private:
       parent.writesTable = true;
       parent.implicitTrap = true;
     }
+    void visitElemDrop(ElemDrop* curr) { parent.writesTable = true; }
     void visitTry(Try* curr) {
       if (curr->delegateTarget.is()) {
         parent.delegateTargets.insert(curr->delegateTarget);
@@ -848,12 +854,30 @@ private:
       }
     }
     void visitRefTest(RefTest* curr) {}
+    void maybeHandleDescriptor(Expression* desc) {
+      if (desc) {
+        // Traps when the descriptor is null.
+        if (desc->type.isNull()) {
+          parent.trap = true;
+        } else if (desc->type.isNullable()) {
+          parent.implicitTrap = true;
+        }
+      }
+    }
     void visitRefCast(RefCast* curr) {
-      // Traps if the ref is not null and the cast fails.
+      // Traps if the cast fails.
+      parent.implicitTrap = true;
+      maybeHandleDescriptor(curr->desc);
+    }
+    void visitRefGetDesc(RefGetDesc* curr) {
+      // Traps if the ref is null.
       parent.implicitTrap = true;
     }
-    void visitBrOn(BrOn* curr) { parent.breakTargets.insert(curr->name); }
-    void visitStructNew(StructNew* curr) {}
+    void visitBrOn(BrOn* curr) {
+      parent.breakTargets.insert(curr->name);
+      maybeHandleDescriptor(curr->desc);
+    }
+    void visitStructNew(StructNew* curr) { maybeHandleDescriptor(curr->desc); }
     void visitStructGet(StructGet* curr) {
       if (curr->ref->type == Type::unreachable) {
         return;
@@ -996,6 +1020,32 @@ private:
     }
     void visitArrayInitData(ArrayInitData* curr) { visitArrayInit(curr); }
     void visitArrayInitElem(ArrayInitElem* curr) { visitArrayInit(curr); }
+    void visitArrayRMW(ArrayRMW* curr) {
+      if (curr->ref->type.isNull()) {
+        parent.trap = true;
+        return;
+      }
+      parent.readsArray = true;
+      parent.writesArray = true;
+      if (curr->ref->type.isNullable()) {
+        parent.implicitTrap = true;
+      }
+      assert(curr->order != MemoryOrder::Unordered);
+      parent.isAtomic = true;
+    }
+    void visitArrayCmpxchg(ArrayCmpxchg* curr) {
+      if (curr->ref->type.isNull()) {
+        parent.trap = true;
+        return;
+      }
+      parent.readsArray = true;
+      parent.writesArray = true;
+      if (curr->ref->type.isNullable()) {
+        parent.implicitTrap = true;
+      }
+      assert(curr->order != MemoryOrder::Unordered);
+      parent.isAtomic = true;
+    }
     void visitRefAs(RefAs* curr) {
       if (curr->op == AnyConvertExtern || curr->op == ExternConvertAny) {
         // These conversions are infallible.
@@ -1041,6 +1091,7 @@ private:
         }
       }
     }
+    void visitStringTest(StringTest* curr) {}
     void visitStringWTF16Get(StringWTF16Get* curr) {
       // traps when ref is null.
       parent.implicitTrap = true;
@@ -1056,6 +1107,12 @@ private:
     void visitContBind(ContBind* curr) {
       // traps when curr->cont is null ref.
       parent.implicitTrap = true;
+
+      // The input continuation is modified, as it will trap if resumed. This is
+      // a globally-noticeable effect, which we model as a call for now, but we
+      // could in theory use something more refined here (|modifiesContinuation|
+      // perhaps, to parallel |writesMemory| etc.).
+      parent.calls = true;
     }
     void visitSuspend(Suspend* curr) {
       // Similar to resume/call: Suspending means that we execute arbitrary

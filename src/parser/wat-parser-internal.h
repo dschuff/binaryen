@@ -22,36 +22,37 @@
 
 namespace wasm::WATParser {
 
-Result<> parseDecls(ParseDeclsCtx& decls);
+Result<> parseModule(ParseDeclsCtx& decls);
+
+Result<> parseModuleBody(ParseDeclsCtx& decls);
 
 Result<> parseTypeDefs(
   ParseDeclsCtx& decls,
   Lexer& input,
   IndexMap& typeIndices,
-  std::vector<HeapTypeDef>& types,
-  std::unordered_map<HeapTypeDef, std::unordered_map<Name, Index>>& typeNames);
+  std::vector<HeapType>& types,
+  std::unordered_map<HeapType, std::unordered_map<Name, Index>>& typeNames);
 
 Result<>
 parseImplicitTypeDefs(ParseDeclsCtx& decls,
                       Lexer& input,
                       IndexMap& typeIndices,
-                      std::vector<HeapTypeDef>& types,
-                      std::unordered_map<Index, HeapTypeDef>& implicitTypes);
+                      std::vector<HeapType>& types,
+                      std::unordered_map<Index, HeapType>& implicitTypes);
 
-Result<>
-parseModuleTypes(ParseDeclsCtx& decls,
-                 Lexer& input,
-                 IndexMap& typeIndices,
-                 std::vector<HeapTypeDef>& types,
-                 std::unordered_map<Index, HeapTypeDef>& implicitTypes);
+Result<> parseModuleTypes(ParseDeclsCtx& decls,
+                          Lexer& input,
+                          IndexMap& typeIndices,
+                          std::vector<HeapType>& types,
+                          std::unordered_map<Index, HeapType>& implicitTypes);
 
 Result<> parseDefinitions(
   ParseDeclsCtx& decls,
   Lexer& input,
   IndexMap& typeIndices,
-  std::vector<HeapTypeDef>& types,
-  std::unordered_map<Index, HeapTypeDef>& implicitTypes,
-  std::unordered_map<HeapTypeDef, std::unordered_map<Name, Index>>& typeNames);
+  std::vector<HeapType>& types,
+  std::unordered_map<Index, HeapType>& implicitTypes,
+  std::unordered_map<HeapType, std::unordered_map<Name, Index>>& typeNames);
 
 // RAII utility for temporarily changing the parsing position of a parsing
 // context.

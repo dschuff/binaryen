@@ -78,6 +78,7 @@ struct ExpressionInterpreter : OverriddenVisitor<ExpressionInterpreter, Flow> {
   Flow visitAtomicWait(AtomicWait* curr) { WASM_UNREACHABLE("TODO"); }
   Flow visitAtomicNotify(AtomicNotify* curr) { WASM_UNREACHABLE("TODO"); }
   Flow visitAtomicFence(AtomicFence* curr) { WASM_UNREACHABLE("TODO"); }
+  Flow visitPause(Pause* curr) { WASM_UNREACHABLE("TODO"); }
   Flow visitSIMDExtract(SIMDExtract* curr) { WASM_UNREACHABLE("TODO"); }
   Flow visitSIMDReplace(SIMDReplace* curr) { WASM_UNREACHABLE("TODO"); }
   Flow visitSIMDShuffle(SIMDShuffle* curr) { WASM_UNREACHABLE("TODO"); }
@@ -233,6 +234,7 @@ struct ExpressionInterpreter : OverriddenVisitor<ExpressionInterpreter, Flow> {
   Flow visitTableFill(TableFill* curr) { WASM_UNREACHABLE("TODO"); }
   Flow visitTableCopy(TableCopy* curr) { WASM_UNREACHABLE("TODO"); }
   Flow visitTableInit(TableInit* curr) { WASM_UNREACHABLE("TODO"); }
+  Flow visitElemDrop(ElemDrop* curr) { WASM_UNREACHABLE("TODO"); }
   Flow visitTry(Try* curr) { WASM_UNREACHABLE("TODO"); }
   Flow visitTryTable(TryTable* curr) { WASM_UNREACHABLE("TODO"); }
   Flow visitThrow(Throw* curr) { WASM_UNREACHABLE("TODO"); }
@@ -245,6 +247,7 @@ struct ExpressionInterpreter : OverriddenVisitor<ExpressionInterpreter, Flow> {
   Flow visitCallRef(CallRef* curr) { WASM_UNREACHABLE("TODO"); }
   Flow visitRefTest(RefTest* curr) { WASM_UNREACHABLE("TODO"); }
   Flow visitRefCast(RefCast* curr) { WASM_UNREACHABLE("TODO"); }
+  Flow visitRefGetDesc(RefGetDesc* curr) { WASM_UNREACHABLE("TODO"); }
   Flow visitBrOn(BrOn* curr) { WASM_UNREACHABLE("TODO"); }
   Flow visitStructNew(StructNew* curr) { WASM_UNREACHABLE("TODO"); }
   Flow visitStructGet(StructGet* curr) { WASM_UNREACHABLE("TODO"); }
@@ -262,6 +265,8 @@ struct ExpressionInterpreter : OverriddenVisitor<ExpressionInterpreter, Flow> {
   Flow visitArrayFill(ArrayFill* curr) { WASM_UNREACHABLE("TODO"); }
   Flow visitArrayInitData(ArrayInitData* curr) { WASM_UNREACHABLE("TODO"); }
   Flow visitArrayInitElem(ArrayInitElem* curr) { WASM_UNREACHABLE("TODO"); }
+  Flow visitArrayRMW(ArrayRMW* curr) { WASM_UNREACHABLE("TODO"); }
+  Flow visitArrayCmpxchg(ArrayCmpxchg* curr) { WASM_UNREACHABLE("TODO"); }
   Flow visitRefAs(RefAs* curr) { WASM_UNREACHABLE("TODO"); }
   Flow visitStringNew(StringNew* curr) { WASM_UNREACHABLE("TODO"); }
   Flow visitStringConst(StringConst* curr) { WASM_UNREACHABLE("TODO"); }
@@ -269,6 +274,7 @@ struct ExpressionInterpreter : OverriddenVisitor<ExpressionInterpreter, Flow> {
   Flow visitStringEncode(StringEncode* curr) { WASM_UNREACHABLE("TODO"); }
   Flow visitStringConcat(StringConcat* curr) { WASM_UNREACHABLE("TODO"); }
   Flow visitStringEq(StringEq* curr) { WASM_UNREACHABLE("TODO"); }
+  Flow visitStringTest(StringTest* curr) { WASM_UNREACHABLE("TODO"); }
   Flow visitStringWTF16Get(StringWTF16Get* curr) { WASM_UNREACHABLE("TODO"); }
   Flow visitStringSliceWTF(StringSliceWTF* curr) { WASM_UNREACHABLE("TODO"); }
   Flow visitContNew(ContNew* curr) { WASM_UNREACHABLE("TODO"); }

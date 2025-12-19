@@ -24,7 +24,8 @@
 //  * No references at all. We can simply remove it.
 //  * References, but no uses. We can't remove it, but we can change it (see
 //    below).
-//  * Uses (which imply references). We must keep it as it is.
+//  * Uses (which imply references). We must keep it as it is, because it is
+//    fully used (e.g. for a function, it is called and may execute).
 //
 // An example of something with a reference but *not* a use is a RefFunc to a
 // function that has no corresponding CallRef to that type. We cannot just
@@ -36,6 +37,7 @@
 //
 
 #include <memory>
+#include <vector>
 
 #include "ir/element-utils.h"
 #include "ir/find_all.h"
@@ -43,10 +45,14 @@
 #include "ir/module-utils.h"
 #include "ir/struct-utils.h"
 #include "ir/subtypes.h"
+#include "ir/table-utils.h"
 #include "ir/utils.h"
 #include "pass.h"
+#include "support/insert_ordered.h"
 #include "support/stdckdint.h"
+#include "support/utilities.h"
 #include "wasm-builder.h"
+#include "wasm-traversal.h"
 #include "wasm.h"
 
 namespace wasm {
@@ -58,25 +64,48 @@ using ModuleElementKind = ModuleItemKind;
 // name of the particular element.
 using ModuleElement = std::pair<ModuleElementKind, Name>;
 
-// Visit or walk an expression to find what things are referenced.
-struct ReferenceFinder
-  : public PostWalker<ReferenceFinder,
-                      UnifiedExpressionVisitor<ReferenceFinder>> {
-  // Our findings are placed in these data structures, which the user of this
-  // code can then process.
-  std::vector<ModuleElement> elements;
+// Information from an indirect call: the name of the table, and the heap type.
+using IndirectCall = std::pair<Name, HeapType>;
+
+// Visit or walk an expression to find important things. We note them on data
+// structures that the caller can then process.
+//
+// We could in theory merge this class in with Analyzer, allowing us to
+// directly apply our findings - that is, rather than add to a data structure,
+// then the caller iterates on it and calls a method on them all, we could call
+// that method as we go. However, separating the classes is simpler as we need
+// different handling in different cases (when scanning for references vs when
+// scanning normally, see below).
+//
+// In theory we could parallelize this class, processing all functions in
+// advance, rather than as we go (single-threaded). However, this turns out not
+// to be faster in practice (perhaps because the single-threaded approach uses
+// less memory).
+struct Noter : public PostWalker<Noter, UnifiedExpressionVisitor<Noter>> {
+  // We mark both uses and references, and also note specific things that
+  // require special handling, like refFuncs.
+  std::vector<ModuleElement> used, referenced;
   std::vector<HeapType> callRefTypes;
   std::vector<Name> refFuncs;
   std::vector<StructField> structFields;
+  std::vector<IndirectCall> indirectCalls;
 
-  // Add an item to the output data structures.
-  void note(ModuleElement element) { elements.push_back(element); }
+  // Note an item on our output data structures.
+  void use(ModuleElement element) { used.push_back(element); }
+  void reference(ModuleElement element) { referenced.push_back(element); }
   void noteCallRef(HeapType type) { callRefTypes.push_back(type); }
   void noteRefFunc(Name refFunc) { refFuncs.push_back(refFunc); }
-  void note(StructField structField) { structFields.push_back(structField); }
+  void noteStructField(StructField structField) {
+    structFields.push_back(structField);
+  }
+  void noteIndirectCall(Name table, HeapType type) {
+    indirectCalls.push_back({table, type});
+  }
 
-  // Generic visitor
-
+  // Generic visitor: Use all the things referenced. This handles e.g. using the
+  // table of a table.get. When we do not want such unconditional use, we
+  // override (e.g. for call_indirect, we don't want to mark the entire table as
+  // used, see below).
   void visitExpression(Expression* curr) {
 #define DELEGATE_ID curr->_id
 
@@ -97,7 +126,7 @@ struct ReferenceFinder
 
 #define DELEGATE_FIELD_NAME_KIND(id, field, kind)                              \
   if (cast->field.is()) {                                                      \
-    note({kind, cast->field});                                                 \
+    use({kind, cast->field});                                                  \
   }
 
 #include "wasm-delegations-fields.def"
@@ -106,9 +135,10 @@ struct ReferenceFinder
   // Specific visitors
 
   void visitCall(Call* curr) {
-    note({ModuleElementKind::Function, curr->target});
+    use({ModuleElementKind::Function, curr->target});
 
-    if (Intrinsics(*getModule()).isCallWithoutEffects(curr)) {
+    Intrinsics intrinsics(*getModule());
+    if (intrinsics.isCallWithoutEffects(curr)) {
       // A call-without-effects receives a function reference and calls it, the
       // same as a CallRef. When we have a flag for non-closed-world, we should
       // handle this automatically by the reference flowing out to an import,
@@ -129,16 +159,20 @@ struct ReferenceFinder
         callRef.target = target;
         visitCallRef(&callRef);
       }
+    } else if (intrinsics.isConfigureAll(curr)) {
+      // Every function that configureAll refers to is signature-called. Mark
+      // them all as called, as JS can call them.
+      for (auto func : intrinsics.getConfigureAllFunctions(curr)) {
+        use({ModuleElementKind::Function, func});
+      }
     }
   }
 
   void visitCallIndirect(CallIndirect* curr) {
-    note({ModuleElementKind::Table, curr->table});
-    // Note a possible call of a function reference as well, as something might
-    // be written into the table during runtime. With precise tracking of what
-    // is written into the table we could do better here; we could also see
-    // which tables are immutable. TODO
-    noteCallRef(curr->heapType);
+    // We refer to the table, but may not use all parts of it, that depends on
+    // the heap type we call with.
+    reference({ModuleElementKind::Table, curr->table});
+    noteIndirectCall(curr->table, curr->heapType);
   }
 
   void visitCallRef(CallRef* curr) {
@@ -157,7 +191,17 @@ struct ReferenceFinder
       return;
     }
     auto type = curr->ref->type.getHeapType();
-    note(StructField{type, curr->index});
+    noteStructField(StructField{type, curr->index});
+  }
+
+  void visitContNew(ContNew* curr) {
+    // The function reference that is passed in here will be called, just as if
+    // we were a call_ref, except at a potentially later time.
+    if (!curr->func->type.isRef()) {
+      return;
+    }
+
+    noteCallRef(curr->func->type.getHeapType());
   }
 };
 
@@ -227,10 +271,27 @@ struct Analyzer {
   std::unordered_map<StructField, std::vector<Expression*>>
     unreadStructFieldExprMap;
 
+  // Cached table data. Each time we see a new call_indirect form (a table and a
+  // type), we must find all the functions that might be called, and their
+  // element segments, as those are now reachable. We parse element segments
+  // once at the start to build an efficient "flat" data structure for later
+  // queries.
+  struct FlatTableInfo {
+    // Maps each heap type that is in this table to the items it can call: the
+    // functions, and their segments. This takes into account subtyping, that
+    // is, typeItemMap[foo] includes data for subtypes of foo, so that we just
+    // need to read one place.
+    std::unordered_map<HeapType, std::unordered_set<Name>> typeFuncs;
+    std::unordered_map<HeapType, std::unordered_set<Name>> typeElems;
+  };
+  std::unordered_map<Name, FlatTableInfo> flatTableInfoMap;
+
   Analyzer(Module* module,
            const PassOptions& options,
            const std::vector<ModuleElement>& roots)
     : module(module), options(options) {
+
+    prepare();
 
     // All roots are used.
     for (auto& element : roots) {
@@ -239,6 +300,28 @@ struct Analyzer {
 
     // Main loop on both the module and the expression queues.
     while (processExpressions() || processModule()) {
+    }
+  }
+
+  void prepare() {
+    for (auto& elem : module->elementSegments) {
+      if (!elem->table) {
+        continue;
+      }
+      auto& flatTableInfo = flatTableInfoMap[elem->table];
+      for (auto* item : elem->data) {
+        if (auto* refFunc = item->dynCast<RefFunc>()) {
+          auto* func = module->getFunction(refFunc->func);
+          std::optional<HeapType> type = func->type.getHeapType();
+          // Add this function and element to all relevant types: each function
+          // might be called by its type, or a supertype.
+          while (type) {
+            flatTableInfo.typeFuncs[*type].insert(func->name);
+            flatTableInfo.typeElems[*type].insert(elem->name);
+            type = type->getSuperType();
+          }
+        }
+      }
     }
   }
 
@@ -255,20 +338,26 @@ struct Analyzer {
 
       // Find references in this expression, and apply them. Anything found here
       // is used.
-      ReferenceFinder finder;
-      finder.setModule(module);
-      finder.visit(curr);
-      for (auto element : finder.elements) {
+      Noter noter;
+      noter.setModule(module);
+      noter.visit(curr);
+      for (auto element : noter.used) {
         use(element);
       }
-      for (auto type : finder.callRefTypes) {
+      for (auto element : noter.referenced) {
+        reference(element);
+      }
+      for (auto type : noter.callRefTypes) {
         useCallRefType(type);
       }
-      for (auto func : finder.refFuncs) {
+      for (auto func : noter.refFuncs) {
         useRefFunc(func);
       }
-      for (auto structField : finder.structFields) {
+      for (auto structField : noter.structFields) {
         useStructField(structField);
+      }
+      for (auto call : noter.indirectCalls) {
+        useIndirectCall(call);
       }
 
       // Scan the children to continue our work.
@@ -312,6 +401,37 @@ struct Analyzer {
     }
   }
 
+  std::unordered_set<IndirectCall> usedIndirectCalls;
+
+  std::optional<TableUtils::TableInfoMap> tableInfoMap;
+
+  void useIndirectCall(IndirectCall call) {
+    auto [_, inserted] = usedIndirectCalls.insert(call);
+    if (!inserted) {
+      return;
+    }
+
+    auto [table, type] = call;
+
+    // Find callable functions and segments.
+    for (auto& func : flatTableInfoMap[table].typeFuncs[type]) {
+      use({ModuleElementKind::Function, func});
+    }
+    for (auto& elem : flatTableInfoMap[table].typeElems[type]) {
+      reference({ModuleElementKind::ElementSegment, elem});
+    }
+
+    // Note a possible call of a function reference as well, if something else
+    // might be written into the table during runtime.
+    // TODO: Add an option for immutable initial content like Directize?
+    if (!tableInfoMap) {
+      tableInfoMap = TableUtils::computeTableInfo(*module);
+    }
+    if ((*tableInfoMap)[table].mayBeModified) {
+      useCallRefType(type);
+    }
+  }
+
   void useRefFunc(Name func) {
     if (!options.closedWorld) {
       // The world is open, so assume the worst and something (inside or outside
@@ -324,7 +444,7 @@ struct Analyzer {
     // case where the target function is referenced but not used.
     auto element = ModuleElement{ModuleElementKind::Function, func};
 
-    auto type = module->getFunction(func)->type;
+    auto type = module->getFunction(func)->type.getHeapType();
     if (calledSignatures.count(type)) {
       // We must not have a type in both calledSignatures and
       // uncalledRefFuncMap: once it is called, we do not track RefFuncs for it
@@ -337,7 +457,7 @@ struct Analyzer {
       // We've never seen a CallRef for this, but might see one later.
       uncalledRefFuncMap[type].insert(func);
 
-      referenced.insert(element);
+      reference(element);
     }
   }
 
@@ -482,6 +602,31 @@ struct Analyzer {
     }
 
     auto* new_ = curr->cast<StructNew>();
+
+    // Use the descriptor right now, normally. We only have special
+    // optimization for struct.new operands, below, because this is not needed
+    // for descriptors: a descriptor must be a struct, and our "lazy reading"
+    // optimization operates on it (if it could be a function, then we'd need to
+    // do more here). In other words, descriptor reads always have a struct "in
+    // the middle", that we can optimize, like here:
+    //
+    //  (struct.new $A
+    //    (ref.func $c)
+    //    (struct.new $A.desc
+    //      (ref.func $d)
+    //    )
+    //  )
+    //
+    // The struct has a ref.func on it, and the descriptor as well. Say we never
+    // read field 0 from $A, then we can avoid marking $c as reached; this is
+    // the usual struct optimization we do, below. Now, say we never read the
+    // descriptor, then we also never read field 0 from $A.desc, that is, the
+    // usual struct optimization on the descriptor class is enough for us to
+    // avoid marking $d as reached.
+    if (new_->desc) {
+      use(new_->desc);
+    }
+
     auto type = new_->type.getHeapType();
 
     for (Index i = 0; i < new_->operands.size(); i++) {
@@ -539,41 +684,18 @@ struct Analyzer {
   // here).
   void addReferences(Expression* curr) {
     // Find references anywhere in this expression so we can apply them.
-    ReferenceFinder finder;
-    finder.setModule(module);
-    finder.walk(curr);
+    Noter noter;
+    noter.setModule(module);
+    noter.walk(curr);
 
-    for (auto element : finder.elements) {
-      // Avoid repeated work. Note that globals with multiple references to
-      // previous globals can lead to exponential work, so this is important.
-      // (If C refers twice to B, and B refers twice to A, then when we process
-      // C we would, naively, scan B twice and A four times.)
-      auto [_, inserted] = referenced.insert(element);
-      if (!inserted) {
-        continue;
-      }
-
-      auto& [kind, value] = element;
-      if (kind == ModuleElementKind::Global) {
-        // Like functions, (non-imported) globals have contents. For functions,
-        // things are simple: if a function ends up with references but no uses
-        // then we can simply empty out the function (by setting its body to an
-        // unreachable). We don't have a simple way to do the same for globals,
-        // unfortunately. For now, scan the global's contents and add references
-        // as needed.
-        // TODO: We could try to empty the global out, for example, replace it
-        //       with a null if it is nullable, or replace all gets of it with
-        //       something else, but that is not trivial.
-        auto* global = module->getGlobal(value);
-        if (!global->imported()) {
-          // Note that infinite recursion is not a danger here since a global
-          // can only refer to previous globals.
-          addReferences(global->init);
-        }
-      }
+    for (auto element : noter.used) {
+      reference(element);
+    }
+    for (auto element : noter.referenced) {
+      reference(element);
     }
 
-    for (auto func : finder.refFuncs) {
+    for (auto func : noter.refFuncs) {
       // If a function ends up referenced but not used then later down we will
       // empty it out by replacing its body with an unreachable, which always
       // validates. For that reason all we need to do here is mark the function
@@ -583,7 +705,7 @@ struct Analyzer {
       // just adding a reference to the function, and not actually using the
       // RefFunc. (Only useRefFunc() + a CallRef of the proper type are enough
       // to make a function itself used.)
-      referenced.insert({ModuleElementKind::Function, func});
+      reference({ModuleElementKind::Function, func});
     }
 
     // Note: nothing to do with |callRefTypes| and |structFields|, which only
@@ -591,6 +713,44 @@ struct Analyzer {
     // elements like functions, globals, and tables. (References to types are
     // handled in an entirely different way in Binaryen IR, and we don't need to
     // worry about it.)
+  }
+
+  void reference(ModuleElement element) {
+    // Avoid repeated work. Note that globals with multiple references to
+    // previous globals can lead to exponential work, so this is important.
+    // (If C refers twice to B, and B refers twice to A, then when we process
+    // C we would, naively, scan B twice and A four times.)
+    auto [_, inserted] = referenced.insert(element);
+    if (!inserted) {
+      return;
+    }
+
+    // Some references force references to their internals, just by being
+    // referenced and present in the output.
+    auto& [kind, value] = element;
+    if (kind == ModuleElementKind::Global) {
+      // Like functions, (non-imported) globals have contents. For functions,
+      // things are simple: if a function ends up with references but no uses
+      // then we can simply empty out the function (by setting its body to an
+      // unreachable). We don't have a simple way to do the same for globals,
+      // unfortunately. For now, scan the global's contents and add references
+      // as needed.
+      // TODO: We could try to empty the global out, for example, replace it
+      //       with a null if it is nullable, or replace all gets of it with
+      //       something else, but that is not trivial.
+      auto* global = module->getGlobal(value);
+      if (!global->imported()) {
+        // Note that infinite recursion is not a danger here since a global
+        // can only refer to previous globals.
+        addReferences(global->init);
+      }
+    } else if (kind == ModuleElementKind::ElementSegment) {
+      // TODO: We could empty out parts of the segment we don't need.
+      auto* segment = module->getElementSegment(value);
+      for (auto* item : segment->data) {
+        addReferences(item);
+      }
+    }
   }
 };
 
@@ -698,12 +858,26 @@ struct RemoveUnusedModuleElements : public Pass {
         }
       });
 
-    // For now, all functions that can be called indirectly are marked as roots.
-    // TODO: Compute this based on which ElementSegments are actually used,
-    //       and which functions have a call_indirect of the proper type.
-    ElementUtils::iterAllElementFunctionNames(module, [&](Name name) {
-      roots.emplace_back(ModuleElementKind::Function, name);
-    });
+    // Just as out-of-bound segments may cause observable traps at instantiation
+    // time, so can struct.new instructions with null descriptors cause traps in
+    // global or element segment initializers.
+    if (!getPassOptions().trapsNeverHappen) {
+      for (auto& segment : module->elementSegments) {
+        for (auto* init : segment->data) {
+          if (isMaybeTrappingInit(*module, init)) {
+            roots.emplace_back(ModuleElementKind::ElementSegment,
+                               segment->name);
+            break;
+          }
+        }
+      }
+      for (auto& global : module->globals) {
+        if (auto* init = global->init;
+            init && isMaybeTrappingInit(*module, init)) {
+          roots.emplace_back(ModuleElementKind::Global, global->name);
+        }
+      }
+    }
 
     // Analyze the module.
     auto& options = getPassOptions();
@@ -824,6 +998,27 @@ struct RemoveUnusedModuleElements : public Pass {
         *name = calledFunc->name;
       }
     }
+  }
+
+  bool isMaybeTrappingInit(Module& wasm, Expression* root) {
+    // Traverse the expression, looking for nullable descriptors passed to
+    // struct.new. The descriptors might be null, which is the only situations
+    // (beyond exceeded implementation limits, which we don't model) that can
+    // lead a constant expression to trap. We depend on other optimizations to
+    // make the descriptors non-nullable if we can determine that they are not
+    // null.
+    struct NullDescFinder : PostWalker<NullDescFinder> {
+      bool mayTrap = false;
+      void visitStructNew(StructNew* curr) {
+        if (curr->desc && curr->desc->type.isNullable()) {
+          mayTrap = true;
+        }
+      }
+    };
+
+    NullDescFinder finder;
+    finder.walk(root);
+    return finder.mayTrap;
   }
 };
 

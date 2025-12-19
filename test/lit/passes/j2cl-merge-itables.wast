@@ -100,7 +100,7 @@
         (global.get $SubObject.vtable)
         (global.get $SubObject.itable)))
     (drop
-      ;; The access to vtable field 0 is offset but the itable size and
+      ;; The access to vtable field 0 is offset by the itable size and
       ;; will be an access to field 1.
       (struct.get $SubObject.vtable 0
         (struct.get $SubObject $vtable
@@ -214,7 +214,7 @@
         (global.get $SubObject.vtable)
         (global.get $SubObject.itable)))
     (drop
-      ;; The access to vtable field 0 is offset but the itable size and
+      ;; The access to vtable field 0 is offset by the itable size and
       ;; will be an access to field 1.
       (struct.get $SubObject.vtable 0
         (struct.get $SubObject $vtable

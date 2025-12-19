@@ -18,8 +18,11 @@
 #define wasm_wasm_type_shape_h
 
 #include <functional>
+#include <list>
+#include <unordered_map>
 #include <vector>
 
+#include "wasm-features.h"
 #include "wasm-type.h"
 
 namespace wasm {
@@ -35,7 +38,13 @@ namespace wasm {
 struct RecGroupShape {
   const std::vector<HeapType>& types;
 
-  RecGroupShape(const std::vector<HeapType>& types) : types(types) {}
+  // Depending on the feature set, some types may be generalized when they are
+  // written out. Take the features into account to ensure our comparisons
+  // account for the rec groups that will ultimately be written.
+  const FeatureSet features;
+
+  RecGroupShape(const std::vector<HeapType>& types, const FeatureSet features)
+    : types(types), features(features) {}
 
   bool operator==(const RecGroupShape& other) const;
   bool operator!=(const RecGroupShape& other) const {
@@ -51,8 +60,9 @@ struct ComparableRecGroupShape : RecGroupShape {
   std::function<bool(HeapType, HeapType)> less;
 
   ComparableRecGroupShape(const std::vector<HeapType>& types,
+                          FeatureSet features,
                           std::function<bool(HeapType, HeapType)> less)
-    : RecGroupShape(types), less(less) {}
+    : RecGroupShape(types, features), less(less) {}
 
   bool operator<(const RecGroupShape& other) const;
   bool operator>(const RecGroupShape& other) const;
@@ -70,5 +80,106 @@ public:
 };
 
 } // namespace std
+
+namespace wasm {
+
+// Provides an infinite sequence of possible brand types, prioritizing those
+// with the most compact encoding.
+struct BrandTypeIterator {
+  static constexpr Index optionCount = 18;
+  static constexpr std::array<Field, optionCount> fieldOptions = {{
+    Field(Field::i8, Mutable),
+    Field(Field::i16, Mutable),
+    Field(Type::i32, Mutable),
+    Field(Type::i64, Mutable),
+    Field(Type::f32, Mutable),
+    Field(Type::f64, Mutable),
+    Field(Type(HeapType::any, Nullable), Mutable),
+    Field(Type(HeapType::func, Nullable), Mutable),
+    Field(Type(HeapType::ext, Nullable), Mutable),
+    Field(Type(HeapType::none, Nullable), Mutable),
+    Field(Type(HeapType::nofunc, Nullable), Mutable),
+    Field(Type(HeapType::noext, Nullable), Mutable),
+    Field(Type(HeapType::any, NonNullable), Mutable),
+    Field(Type(HeapType::func, NonNullable), Mutable),
+    Field(Type(HeapType::ext, NonNullable), Mutable),
+    Field(Type(HeapType::none, NonNullable), Mutable),
+    Field(Type(HeapType::nofunc, NonNullable), Mutable),
+    Field(Type(HeapType::noext, NonNullable), Mutable),
+  }};
+
+  struct FieldInfo {
+    uint8_t index = 0;
+    bool immutable = false;
+
+    operator Field() const {
+      auto field = fieldOptions[index];
+      if (immutable) {
+        field.mutable_ = Immutable;
+      }
+      return field;
+    }
+
+    bool advance() {
+      if (!immutable) {
+        immutable = true;
+        return true;
+      }
+      immutable = false;
+      index = (index + 1) % optionCount;
+      return index != 0;
+    }
+  };
+
+  bool useArray = false;
+  std::vector<FieldInfo> fields;
+
+  HeapType operator*() const {
+    if (useArray) {
+      return Array(fields[0]);
+    }
+    return Struct(std::vector<Field>(fields.begin(), fields.end()));
+  }
+
+  BrandTypeIterator& operator++() {
+    for (Index i = fields.size(); i > 0; --i) {
+      if (fields[i - 1].advance()) {
+        return *this;
+      }
+    }
+    if (useArray) {
+      useArray = false;
+      return *this;
+    }
+    fields.emplace_back();
+    useArray = fields.size() == 1;
+    return *this;
+  }
+};
+
+// A set of unique rec group shapes. Upon inserting a new group of types, if it
+// has the same shape as a previously inserted group, the types will be rebuilt
+// with an extra brand type at the end of the group that differentiates it from
+// previous group.
+struct UniqueRecGroups {
+  using Groups = std::list<std::vector<HeapType>>;
+  Groups groups;
+  std::unordered_map<RecGroupShape, Groups::iterator> shapes;
+
+  FeatureSet features;
+
+  UniqueRecGroups(FeatureSet features) : features(features) {}
+
+  // Insert a rec group. If it is already unique, return the original types.
+  // Otherwise rebuild the group to make it unique and return the rebuilt types,
+  // including the brand.
+  const std::vector<HeapType>& insert(std::vector<HeapType> group);
+
+  // If the group is unique, insert it and return the types. Otherwise, return
+  // the types that already have this shape.
+  const std::vector<HeapType>& insertOrGet(std::vector<HeapType> group);
+};
+
+} // namespace wasm
 
 #endif // wasm_wasm_type_shape_h

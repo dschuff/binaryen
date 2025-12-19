@@ -364,10 +364,10 @@
 
   ;; TNH:      (func $select.arm.null.effects (type $void)
   ;; TNH-NEXT:  (local $temp i32)
-  ;; TNH-NEXT:  (local $1 (ref $struct))
-  ;; TNH-NEXT:  (local $2 (ref $struct))
+  ;; TNH-NEXT:  (local $1 (ref (exact $struct)))
+  ;; TNH-NEXT:  (local $2 (ref (exact $struct)))
   ;; TNH-NEXT:  (struct.set $struct 0
-  ;; TNH-NEXT:   (block (result (ref $struct))
+  ;; TNH-NEXT:   (block (result (ref (exact $struct)))
   ;; TNH-NEXT:    (local.set $1
   ;; TNH-NEXT:     (struct.new $struct
   ;; TNH-NEXT:      (local.tee $temp
@@ -393,7 +393,7 @@
   ;; TNH-NEXT:   (i32.const 1)
   ;; TNH-NEXT:  )
   ;; TNH-NEXT:  (struct.set $struct 0
-  ;; TNH-NEXT:   (block (result (ref $struct))
+  ;; TNH-NEXT:   (block (result (ref (exact $struct)))
   ;; TNH-NEXT:    (drop
   ;; TNH-NEXT:     (block (result nullref)
   ;; TNH-NEXT:      (local.set $temp
@@ -402,7 +402,7 @@
   ;; TNH-NEXT:      (ref.null none)
   ;; TNH-NEXT:     )
   ;; TNH-NEXT:    )
-  ;; TNH-NEXT:    (block (result (ref $struct))
+  ;; TNH-NEXT:    (block (result (ref (exact $struct)))
   ;; TNH-NEXT:     (local.set $2
   ;; TNH-NEXT:      (struct.new $struct
   ;; TNH-NEXT:       (local.tee $temp
@@ -422,7 +422,7 @@
   ;; NO_TNH:      (func $select.arm.null.effects (type $void)
   ;; NO_TNH-NEXT:  (local $temp i32)
   ;; NO_TNH-NEXT:  (struct.set $struct 0
-  ;; NO_TNH-NEXT:   (select (result (ref null $struct))
+  ;; NO_TNH-NEXT:   (select (result (ref null (exact $struct)))
   ;; NO_TNH-NEXT:    (struct.new $struct
   ;; NO_TNH-NEXT:     (local.tee $temp
   ;; NO_TNH-NEXT:      (i32.const 1)
@@ -439,7 +439,7 @@
   ;; NO_TNH-NEXT:   (i32.const 1)
   ;; NO_TNH-NEXT:  )
   ;; NO_TNH-NEXT:  (struct.set $struct 0
-  ;; NO_TNH-NEXT:   (select (result (ref null $struct))
+  ;; NO_TNH-NEXT:   (select (result (ref null (exact $struct)))
   ;; NO_TNH-NEXT:    (block (result nullref)
   ;; NO_TNH-NEXT:     (local.set $temp
   ;; NO_TNH-NEXT:      (i32.const 2)
@@ -651,14 +651,6 @@
   )
 
   ;; TNH:      (func $cast-if-null (type $5) (param $x (ref none)) (result (ref $struct))
-  ;; TNH-NEXT:  (drop
-  ;; TNH-NEXT:   (block
-  ;; TNH-NEXT:    (drop
-  ;; TNH-NEXT:     (i32.const 1)
-  ;; TNH-NEXT:    )
-  ;; TNH-NEXT:    (unreachable)
-  ;; TNH-NEXT:   )
-  ;; TNH-NEXT:  )
   ;; TNH-NEXT:  (unreachable)
   ;; TNH-NEXT: )
   ;; NO_TNH:      (func $cast-if-null (type $5) (param $x (ref none)) (result (ref $struct))
@@ -676,7 +668,7 @@
   ;; NO_TNH-NEXT:  (unreachable)
   ;; NO_TNH-NEXT: )
   (func $cast-if-null (param $x (ref none)) (result (ref $struct))
-    ;; We can remove the unreachable arm of the if here in TNH mode. While doing
+    ;; We can remove the reachable arm of the if here in TNH mode. While doing
     ;; so we must refinalize properly or else we'll hit an error in pass-debug
     ;; mode.
     (ref.cast (ref $struct)
@@ -693,14 +685,6 @@
   )
 
   ;; TNH:      (func $cast-if-null-flip (type $5) (param $x (ref none)) (result (ref $struct))
-  ;; TNH-NEXT:  (drop
-  ;; TNH-NEXT:   (block
-  ;; TNH-NEXT:    (drop
-  ;; TNH-NEXT:     (i32.const 1)
-  ;; TNH-NEXT:    )
-  ;; TNH-NEXT:    (unreachable)
-  ;; TNH-NEXT:   )
-  ;; TNH-NEXT:  )
   ;; TNH-NEXT:  (unreachable)
   ;; TNH-NEXT: )
   ;; NO_TNH:      (func $cast-if-null-flip (type $5) (param $x (ref none)) (result (ref $struct))
@@ -734,62 +718,27 @@
 
   ;; TNH:      (func $cast-to-bottom (type $11) (param $ref (ref any)) (param $nullable-ref anyref)
   ;; TNH-NEXT:  (drop
-  ;; TNH-NEXT:   (block (result (ref none))
-  ;; TNH-NEXT:    (drop
-  ;; TNH-NEXT:     (local.get $ref)
-  ;; TNH-NEXT:    )
-  ;; TNH-NEXT:    (unreachable)
-  ;; TNH-NEXT:   )
+  ;; TNH-NEXT:   (unreachable)
   ;; TNH-NEXT:  )
   ;; TNH-NEXT:  (drop
-  ;; TNH-NEXT:   (block (result (ref none))
-  ;; TNH-NEXT:    (drop
-  ;; TNH-NEXT:     (local.get $nullable-ref)
-  ;; TNH-NEXT:    )
-  ;; TNH-NEXT:    (unreachable)
-  ;; TNH-NEXT:   )
+  ;; TNH-NEXT:   (unreachable)
   ;; TNH-NEXT:  )
   ;; TNH-NEXT:  (drop
-  ;; TNH-NEXT:   (block (result (ref none))
-  ;; TNH-NEXT:    (drop
-  ;; TNH-NEXT:     (local.get $ref)
-  ;; TNH-NEXT:    )
-  ;; TNH-NEXT:    (unreachable)
-  ;; TNH-NEXT:   )
+  ;; TNH-NEXT:   (unreachable)
   ;; TNH-NEXT:  )
   ;; TNH-NEXT:  (drop
-  ;; TNH-NEXT:   (block (result nullref)
-  ;; TNH-NEXT:    (drop
-  ;; TNH-NEXT:     (local.get $nullable-ref)
-  ;; TNH-NEXT:    )
-  ;; TNH-NEXT:    (ref.null none)
-  ;; TNH-NEXT:   )
+  ;; TNH-NEXT:   (ref.null none)
   ;; TNH-NEXT:  )
   ;; TNH-NEXT: )
   ;; NO_TNH:      (func $cast-to-bottom (type $11) (param $ref (ref any)) (param $nullable-ref anyref)
   ;; NO_TNH-NEXT:  (drop
-  ;; NO_TNH-NEXT:   (block (result (ref none))
-  ;; NO_TNH-NEXT:    (drop
-  ;; NO_TNH-NEXT:     (local.get $ref)
-  ;; NO_TNH-NEXT:    )
-  ;; NO_TNH-NEXT:    (unreachable)
-  ;; NO_TNH-NEXT:   )
+  ;; NO_TNH-NEXT:   (unreachable)
   ;; NO_TNH-NEXT:  )
   ;; NO_TNH-NEXT:  (drop
-  ;; NO_TNH-NEXT:   (block (result (ref none))
-  ;; NO_TNH-NEXT:    (drop
-  ;; NO_TNH-NEXT:     (local.get $nullable-ref)
-  ;; NO_TNH-NEXT:    )
-  ;; NO_TNH-NEXT:    (unreachable)
-  ;; NO_TNH-NEXT:   )
+  ;; NO_TNH-NEXT:   (unreachable)
   ;; NO_TNH-NEXT:  )
   ;; NO_TNH-NEXT:  (drop
-  ;; NO_TNH-NEXT:   (block (result (ref none))
-  ;; NO_TNH-NEXT:    (drop
-  ;; NO_TNH-NEXT:     (local.get $ref)
-  ;; NO_TNH-NEXT:    )
-  ;; NO_TNH-NEXT:    (unreachable)
-  ;; NO_TNH-NEXT:   )
+  ;; NO_TNH-NEXT:   (unreachable)
   ;; NO_TNH-NEXT:  )
   ;; NO_TNH-NEXT:  (drop
   ;; NO_TNH-NEXT:   (ref.cast nullref
@@ -958,9 +907,9 @@
 
   ;; TNH:      (func $if.null.child.but.no.flow (type $void)
   ;; TNH-NEXT:  (drop
-  ;; TNH-NEXT:   (block (result (ref nofunc))
+  ;; TNH-NEXT:   (block
   ;; TNH-NEXT:    (drop
-  ;; TNH-NEXT:     (if (result (ref nofunc))
+  ;; TNH-NEXT:     (if
   ;; TNH-NEXT:      (i32.const 1)
   ;; TNH-NEXT:      (then
   ;; TNH-NEXT:       (return)
@@ -976,9 +925,9 @@
   ;; TNH-NEXT: )
   ;; NO_TNH:      (func $if.null.child.but.no.flow (type $void)
   ;; NO_TNH-NEXT:  (drop
-  ;; NO_TNH-NEXT:   (block (result (ref nofunc))
+  ;; NO_TNH-NEXT:   (block
   ;; NO_TNH-NEXT:    (drop
-  ;; NO_TNH-NEXT:     (if (result (ref nofunc))
+  ;; NO_TNH-NEXT:     (if
   ;; NO_TNH-NEXT:      (i32.const 1)
   ;; NO_TNH-NEXT:      (then
   ;; NO_TNH-NEXT:       (return)

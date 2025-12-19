@@ -86,6 +86,33 @@ public:
 
     return ModuleRunnerBase<EvallingModuleRunner>::visitGlobalGet(curr);
   }
+
+  Flow visitTableGet(TableGet* curr) {
+    // We support tableLoad, below, so that call_indirect works (it calls it
+    // internally), but we want to disable table.get for now.
+    throw FailToEvalException("TODO: table.get");
+  }
+
+  bool allowContNew = true;
+
+  Flow visitContNew(ContNew* curr) {
+    if (!allowContNew) {
+      throw FailToEvalException("cont.new disallowed");
+    }
+    return ModuleRunnerBase<EvallingModuleRunner>::visitContNew(curr);
+  }
+
+  // This needs to be duplicated from ModuleRunner, unfortunately.
+  Literal makeFuncData(Name name, Type type) {
+    auto allocation =
+      std::make_shared<FuncData>(name, this, [this, name](Literals arguments) {
+        return callFunction(name, arguments);
+      });
+#if __has_feature(leak_sanitizer) || __has_feature(address_sanitizer)
+    __lsan_ignore_object(allocation.get());
+#endif
+    return Literal(allocation, type);
+  }
 };
 
 // Build an artificial `env` module based on a module's imports, so that the
@@ -224,88 +251,93 @@ struct CtorEvalExternalInterface : EvallingModuleRunner::ExternalInterface {
     });
   }
 
-  Literals callImport(Function* import, const Literals& arguments) override {
-    Name WASI("wasi_snapshot_preview1");
+  Literal getImportedFunction(Function* import) override {
+    auto f = [import, this](const Literals& arguments) -> Flow {
+      Name WASI("wasi_snapshot_preview1");
 
-    if (ignoreExternalInput) {
-      if (import->module == WASI) {
-        if (import->base == "environ_sizes_get") {
-          if (arguments.size() != 2 || arguments[0].type != Type::i32 ||
-              import->getResults() != Type::i32) {
-            throw FailToEvalException("wasi environ_sizes_get has wrong sig");
+      if (ignoreExternalInput) {
+        if (import->module == WASI) {
+          if (import->base == "environ_sizes_get") {
+            if (arguments.size() != 2 || arguments[0].type != Type::i32 ||
+                import->getResults() != Type::i32) {
+              throw FailToEvalException("wasi environ_sizes_get has wrong sig");
+            }
+
+            // Write out a count of i32(0) and return __WASI_ERRNO_SUCCESS
+            // (0).
+            store32(arguments[0].geti32(), 0, wasm->memories[0]->name);
+            return {Literal(int32_t(0))};
           }
 
-          // Write out a count of i32(0) and return __WASI_ERRNO_SUCCESS (0).
-          store32(arguments[0].geti32(), 0, wasm->memories[0]->name);
-          return {Literal(int32_t(0))};
-        }
+          if (import->base == "environ_get") {
+            if (arguments.size() != 2 || arguments[0].type != Type::i32 ||
+                import->getResults() != Type::i32) {
+              throw FailToEvalException("wasi environ_get has wrong sig");
+            }
 
-        if (import->base == "environ_get") {
-          if (arguments.size() != 2 || arguments[0].type != Type::i32 ||
-              import->getResults() != Type::i32) {
-            throw FailToEvalException("wasi environ_get has wrong sig");
+            // Just return __WASI_ERRNO_SUCCESS (0).
+            return {Literal(int32_t(0))};
           }
 
-          // Just return __WASI_ERRNO_SUCCESS (0).
-          return {Literal(int32_t(0))};
-        }
+          if (import->base == "args_sizes_get") {
+            if (arguments.size() != 2 || arguments[0].type != Type::i32 ||
+                import->getResults() != Type::i32) {
+              throw FailToEvalException("wasi args_sizes_get has wrong sig");
+            }
 
-        if (import->base == "args_sizes_get") {
-          if (arguments.size() != 2 || arguments[0].type != Type::i32 ||
-              import->getResults() != Type::i32) {
-            throw FailToEvalException("wasi args_sizes_get has wrong sig");
+            // Write out an argc of i32(0) and return a __WASI_ERRNO_SUCCESS
+            // (0).
+            store32(arguments[0].geti32(), 0, wasm->memories[0]->name);
+            return {Literal(int32_t(0))};
           }
 
-          // Write out an argc of i32(0) and return a __WASI_ERRNO_SUCCESS (0).
-          store32(arguments[0].geti32(), 0, wasm->memories[0]->name);
-          return {Literal(int32_t(0))};
-        }
+          if (import->base == "args_get") {
+            if (arguments.size() != 2 || arguments[0].type != Type::i32 ||
+                import->getResults() != Type::i32) {
+              throw FailToEvalException("wasi args_get has wrong sig");
+            }
 
-        if (import->base == "args_get") {
-          if (arguments.size() != 2 || arguments[0].type != Type::i32 ||
-              import->getResults() != Type::i32) {
-            throw FailToEvalException("wasi args_get has wrong sig");
+            // Just return __WASI_ERRNO_SUCCESS (0).
+            return {Literal(int32_t(0))};
           }
 
-          // Just return __WASI_ERRNO_SUCCESS (0).
-          return {Literal(int32_t(0))};
+          // Otherwise, we don't recognize this import; continue normally to
+          // error.
         }
-
-        // Otherwise, we don't recognize this import; continue normally to
-        // error.
       }
-    }
 
-    std::string extra;
-    if (import->module == ENV && import->base == "___cxa_atexit") {
-      extra = RECOMMENDATION "build with -s NO_EXIT_RUNTIME=1 so that calls "
-                             "to atexit are not emitted";
-    } else if (import->module == WASI && !ignoreExternalInput) {
-      extra = RECOMMENDATION "consider --ignore-external-input";
-    }
-    throw FailToEvalException(std::string("call import: ") +
-                              import->module.toString() + "." +
-                              import->base.toString() + extra);
+      std::string extra;
+      if (import->module == ENV && import->base == "___cxa_atexit") {
+        extra = RECOMMENDATION "build with -s NO_EXIT_RUNTIME=1 so that calls "
+                               "to atexit are not emitted";
+      } else if (import->module == WASI && !ignoreExternalInput) {
+        extra = RECOMMENDATION "consider --ignore-external-input";
+      }
+      throw FailToEvalException(std::string("call import: ") +
+                                import->module.toString() + "." +
+                                import->base.toString() + extra);
+    };
+    // Use a null instance because these are either host functions or imported
+    // from unknown sources.
+    // TODO: Be more precise about the types we allow these imports to have.
+    return Literal(std::make_shared<FuncData>(import->name, nullptr, f),
+                   import->type);
+  }
+
+  Tag* getImportedTag(Tag* tag) override {
+    WASM_UNREACHABLE("missing imported tag");
   }
 
   // We assume the table is not modified FIXME
-  Literals callTable(Name tableName,
-                     Address index,
-                     HeapType sig,
-                     Literals& arguments,
-                     Type result,
-                     EvallingModuleRunner& instance) override {
-
-    std::unordered_map<wasm::Name, std::vector<wasm::Name>>::iterator it;
-
+  Literal tableLoad(Name tableName, Address index) override {
     auto* table = wasm->getTableOrNull(tableName);
     if (!table) {
-      throw FailToEvalException("callTable on non-existing table");
+      throw FailToEvalException("tableLoad on non-existing table");
     }
 
-    // Look through the segments and find the function. Segments can overlap,
+    // Look through the segments and find the value. Segments can overlap,
     // so we want the last one.
-    Name targetFunc;
+    Expression* value = nullptr;
     for (auto& segment : wasm->elementSegments) {
       if (segment->table != tableName) {
         continue;
@@ -326,45 +358,26 @@ struct CtorEvalExternalInterface : EvallingModuleRunner::ExternalInterface {
       }
       auto end = start + segment->data.size();
       if (start <= index && index < end) {
-        auto entry = segment->data[index - start];
-        if (auto* get = entry->dynCast<RefFunc>()) {
-          targetFunc = get->func;
-        } else {
-          throw FailToEvalException(
-            std::string("callTable on uninitialized entry"));
-        }
+        value = segment->data[index - start];
       }
     }
 
-    if (!targetFunc.is()) {
-      throw FailToEvalException(
-        std::string("callTable on index not found in static segments: ") +
-        std::to_string(index));
+    if (!value) {
+      // No segment had a value for this.
+      return Literal::makeNull(HeapTypes::func);
     }
-
-    // If this is one of our functions, we can call it; if it was
-    // imported, fail.
-    auto* func = wasm->getFunction(targetFunc);
-    if (func->type != sig) {
-      throw FailToEvalException(std::string("callTable signature mismatch: ") +
-                                targetFunc.toString());
+    if (!Properties::isConstantExpression(value)) {
+      throw FailToEvalException("tableLoad of non-literal");
     }
-    if (!func->imported()) {
-      return instance.callFunction(targetFunc, arguments);
-    } else {
-      throw FailToEvalException(
-        std::string("callTable on imported function: ") +
-        targetFunc.toString());
+    if (auto* r = value->dynCast<RefFunc>()) {
+      return instance->makeFuncData(r->func, r->type);
     }
+    return Properties::getLiteral(value);
   }
 
   Index tableSize(Name tableName) override {
-    // See callTable above, we assume the table is not modified FIXME
+    // See tableLoad above, we assume the table is not modified FIXME
     return wasm->getTableOrNull(tableName)->initial;
-  }
-
-  Literal tableLoad(Name tableName, Address index) override {
-    throw FailToEvalException("table.get: TODO");
   }
 
   // called during initialization
@@ -810,8 +823,14 @@ public:
   // If |possibleDefiningGlobal| is provided, it is the name of a global that we
   // are in the init expression of, and which can be reused as defining global,
   // if the other conditions are suitable.
+  //
+  // Returns nullptr if we cannot serialize.
   Expression* getSerialization(Literal value,
                                Name possibleDefiningGlobal = Name()) {
+    if (value.isContinuation()) {
+      return nullptr;
+    }
+
     Builder builder(*wasm);
 
     // If this is externalized then we want to inspect the inner data, handle
@@ -850,7 +869,7 @@ public:
     } else {
       // This is the first usage of this data. Generate a struct.new /
       // array.new for it.
-      auto& values = value.getGCData()->values;
+      auto& values = data->values;
       std::vector<Expression*> args;
 
       // The initial values for this allocation may themselves be GC
@@ -873,13 +892,25 @@ public:
       }
 
       for (auto& value : values) {
-        args.push_back(getSerialization(value));
+        auto* serialized = getSerialization(value);
+        if (!serialized) {
+          return nullptr;
+        }
+        args.push_back(serialized);
+      }
+
+      Expression* desc = nullptr;
+      if (data->desc.getGCData()) {
+        desc = getSerialization(data->desc);
+        if (!desc) {
+          return nullptr;
+        }
       }
 
       Expression* init;
       auto heapType = type.getHeapType();
       if (heapType.isStruct()) {
-        init = builder.makeStructNew(heapType, args);
+        init = builder.makeStructNew(heapType, args, desc);
       } else if (heapType.isArray()) {
         // TODO: for repeated identical values, can use ArrayNew
         init = builder.makeArrayNewFixed(heapType, args);
@@ -920,7 +951,11 @@ public:
       assert(possibleDefiningGlobal.isNull());
       std::vector<Expression*> children;
       for (const auto& value : values) {
-        children.push_back(getSerialization(value));
+        auto* serialized = getSerialization(value);
+        if (!serialized) {
+          return nullptr;
+        }
+        children.push_back(serialized);
       }
       return Builder(*wasm).makeTupleMake(children);
     }
@@ -960,8 +995,10 @@ public:
       set =
         builder.makeStructSet(index, getGlobal, value, MemoryOrder::Unordered);
     } else {
-      set = builder.makeArraySet(
-        getGlobal, builder.makeConst(int32_t(index)), value);
+      set = builder.makeArraySet(getGlobal,
+                                 builder.makeConst(int32_t(index)),
+                                 value,
+                                 MemoryOrder::Unordered);
     }
 
     (*startBlock)->list.push_back(set);
@@ -1113,6 +1150,18 @@ start_eval:
           }
         }
         break;
+      } catch (NonconstantException& fail) {
+        if (!quiet) {
+          std::cout << "  ...stopping due to non-constant func\n";
+        }
+        break;
+      }
+
+      if (flow.breakTo == NONCONSTANT_FLOW) {
+        if (!quiet) {
+          std::cout << "  ...stopping due to non-constant flow\n";
+        }
+        break;
       }
 
       if (flow.breakTo == RETURN_CALL_FLOW) {
@@ -1125,7 +1174,17 @@ start_eval:
         // state in case we fail to eval the new function.
         localExprs.clear();
         for (auto& param : params) {
-          localExprs.push_back(interface.getSerialization(param));
+          auto* serialized = interface.getSerialization(param);
+          if (!serialized) {
+            break;
+          }
+          localExprs.push_back(serialized);
+        }
+        if (localExprs.size() < params.size()) {
+          if (!quiet) {
+            std::cout << "  ...stopping due to non-serializable param\n";
+          }
+          break;
         }
         interface.applyToModule();
         goto start_eval;
@@ -1145,7 +1204,17 @@ start_eval:
       // serialization sets from scratch each time here, for all locals.
       localExprs.clear();
       for (Index i = 0; i < func->getNumLocals(); i++) {
-        localExprs.push_back(interface.getSerialization(scope.locals[i]));
+        auto* serialized = interface.getSerialization(scope.locals[i]);
+        if (!serialized) {
+          break;
+        }
+        localExprs.push_back(serialized);
+      }
+      if (localExprs.size() < func->getNumLocals()) {
+        if (!quiet) {
+          std::cout << "  ...stopping due to non-serializable local\n";
+        }
+        break;
       }
       interface.applyToModule();
       successes++;
@@ -1155,6 +1224,16 @@ start_eval:
       results = flow.values;
 
       if (flow.breaking()) {
+        if (flow.suspendTag) {
+          // A suspend reached the exit of the function, so it is unhandled in
+          // it. TODO: We could support the case of the calling function
+          // handling it.
+          if (!quiet) {
+            std::cout << "  ...stopping due to unhandled suspend\n";
+          }
+          return EvalCtorOutcome();
+        }
+
         // We are returning out of the function (either via a return, or via a
         // break to |block|, which has the same outcome. That means we don't
         // need to execute any more lines, and can consider them to be
@@ -1223,7 +1302,8 @@ start_eval:
       // signature. If there is a mismatch, shift the local indices to make room
       // for the unused parameters.
       std::vector<Type> localTypes;
-      auto originalParams = originalFuncType.getSignature().params;
+      auto originalParams =
+        originalFuncType.getHeapType().getSignature().params;
       if (originalParams != func->getParams()) {
         // Add locals for the body to use instead of using the params.
         for (auto type : func->getParams()) {
@@ -1287,6 +1367,7 @@ void evalCtors(Module& wasm,
   try {
     // create an instance for evalling
     EvallingModuleRunner instance(wasm, &interface, linkedInstances);
+    instance.instantiate();
     interface.instanceInitialized = true;
     // go one by one, in order, until we fail
     // TODO: if we knew priorities, we could reorder?
@@ -1298,8 +1379,39 @@ void evalCtors(Module& wasm,
       if (!ex || ex->kind != ExternalKind::Function) {
         Fatal() << "export not found: " << ctor;
       }
-      auto funcName = *ex->getInternalName();
-      auto outcome = evalCtor(instance, interface, funcName, ctor);
+
+      auto* func = wasm.getFunction(*ex->getInternalName());
+
+      // Disallow cont.new when we are keeping the export. The problem is that
+      // we may end up with a serialization problem later:
+      //
+      //  (func $foo (export "foo") (result (ref $cont))
+      //    (global.set ..) ;; side effect
+      //    (cont.new ..)
+      //  )
+      //
+      // We will fail to serialize the result of the function here. But
+      // noticing that when we handle keeping of the export is too late, as we
+      // will have already applied global effects to the module (in the example
+      // above, the global.set will have run). That means we cannot just keep
+      // the export by serializing the result and using that as the body (or
+      // part of the body), as serialization fails. We would need to go back in
+      // time and undo any side effects here. Instead, if we will need the
+      // export, disallow things that can block serialization, if we may end up
+      // needing to serialize.
+      bool keeping = keptExportsSet.count(ctor);
+      if (!keeping) {
+        instance.allowContNew = true;
+      } else {
+        // Any reference type might refer to a continuation (indirectly, that
+        // is, it might refer to something with a continuation field), so
+        // disallow refs too.
+        auto features = func->getResults().getFeatures();
+        instance.allowContNew =
+          !features.hasStackSwitching() && !features.hasReferenceTypes();
+      }
+
+      auto outcome = evalCtor(instance, interface, func->name, ctor);
       if (!outcome) {
         if (!quiet) {
           std::cout << "  ...stopping\n";
@@ -1314,21 +1426,22 @@ void evalCtors(Module& wasm,
 
       // Remove the export if we should.
       auto* exp = wasm.getExport(ctor);
-      if (!keptExportsSet.count(ctor)) {
+      if (!keeping) {
         wasm.removeExport(exp->name);
       } else {
         // We are keeping around the export, which should now refer to an
         // empty function since calling the export should do nothing.
-        auto* func = wasm.getFunction((exp->kind == ExternalKind::Function)
-                                        ? *exp->getInternalName()
-                                        : Name());
         auto copyName = Names::getValidFunctionName(wasm, func->name);
-        auto* copyFunc = ModuleUtils::copyFunction(func, wasm, copyName);
+        auto copyFunc =
+          ModuleUtils::copyFunctionWithoutAdd(func, wasm, copyName);
         if (func->getResults() == Type::none) {
           copyFunc->body = Builder(wasm).makeNop();
         } else {
           copyFunc->body = interface.getSerialization(*outcome);
+          // We have ruled out serialization problems earlier.
+          assert(copyFunc->body);
         }
+        wasm.addFunction(std::move(copyFunc));
         *wasm.getExport(exp->name)->getInternalName() = copyName;
       }
     }

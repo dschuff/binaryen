@@ -3,9 +3,8 @@
 ;; RUN: foreach %s %t wasm-opt -O -all --closed-world -S -o - | filecheck %s
 ;; RUN: foreach %s %t wasm-opt -O -all                -S -o - | filecheck %s --check-prefix OPEN_WORLD
 
-;; Test that -O, with nominal typing + GC enabled, will run global type
-;; optimization in conjunction with constant field propagation etc. But, in an
-;; open world we do not run them.
+;; Test that -O with GC enabled will run global type optimization in conjunction
+;; with constant field propagation etc. in closed world mode only.
 
 (module
   ;; OPEN_WORLD:      (type $struct (sub (struct (field (mut funcref)) (field (mut i32)))))
@@ -15,7 +14,7 @@
 
   ;; OPEN_WORLD:      (type $2 (func (result i32)))
 
-  ;; OPEN_WORLD:      (global $glob (ref $struct) (struct.new $struct
+  ;; OPEN_WORLD:      (global $glob (ref (exact $struct)) (struct.new $struct
   ;; OPEN_WORLD-NEXT:  (ref.func $by-ref)
   ;; OPEN_WORLD-NEXT:  (i32.const 100)
   ;; OPEN_WORLD-NEXT: ))

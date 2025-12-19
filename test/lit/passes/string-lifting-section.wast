@@ -2,7 +2,7 @@
 
 ;; Lower first to generate the string.consts custom section, then lift it back.
 
-;; RUN: foreach %s %t wasm-opt -all --string-lowering --string-lifting -S -o - | filecheck %s
+;; RUN: wasm-opt %s -all --string-lowering --string-lifting -S -o - | filecheck %s
 
 (module
   ;; CHECK:      (type $0 (array (mut i16)))
@@ -11,15 +11,15 @@
 
   ;; CHECK:      (type $2 (func (param externref externref) (result i32)))
 
-  ;; CHECK:      (type $3 (func (param (ref null $0) i32 i32) (result (ref extern))))
+  ;; CHECK:      (type $3 (func (param externref) (result i32)))
 
-  ;; CHECK:      (type $4 (func (param i32) (result (ref extern))))
+  ;; CHECK:      (type $4 (func (param (ref null $0) i32 i32) (result (ref extern))))
 
-  ;; CHECK:      (type $5 (func (param externref externref) (result (ref extern))))
+  ;; CHECK:      (type $5 (func (param i32) (result (ref extern))))
 
-  ;; CHECK:      (type $6 (func (param externref (ref null $0) i32) (result i32)))
+  ;; CHECK:      (type $6 (func (param externref externref) (result (ref extern))))
 
-  ;; CHECK:      (type $7 (func (param externref) (result i32)))
+  ;; CHECK:      (type $7 (func (param externref (ref null $0) i32) (result i32)))
 
   ;; CHECK:      (type $8 (func (param externref i32) (result i32)))
 
@@ -37,19 +37,23 @@
 
   ;; CHECK:      (import "string.const" "5" (global $"string.const_\"unpaired low surrogate \\ed\\bd\\88 \"" (ref extern)))
 
-  ;; CHECK:      (import "wasm:js-string" "fromCharCodeArray" (func $fromCharCodeArray (type $3) (param (ref null $0) i32 i32) (result (ref extern))))
+  ;; CHECK:      (import "string.const" "6" (global $"string.const_\"z\\\\\"" (ref extern)))
 
-  ;; CHECK:      (import "wasm:js-string" "fromCodePoint" (func $fromCodePoint (type $4) (param i32) (result (ref extern))))
+  ;; CHECK:      (import "wasm:js-string" "fromCharCodeArray" (func $fromCharCodeArray (type $4) (param (ref null $0) i32 i32) (result (ref extern))))
 
-  ;; CHECK:      (import "wasm:js-string" "concat" (func $concat (type $5) (param externref externref) (result (ref extern))))
+  ;; CHECK:      (import "wasm:js-string" "fromCodePoint" (func $fromCodePoint (type $5) (param i32) (result (ref extern))))
 
-  ;; CHECK:      (import "wasm:js-string" "intoCharCodeArray" (func $intoCharCodeArray (type $6) (param externref (ref null $0) i32) (result i32)))
+  ;; CHECK:      (import "wasm:js-string" "concat" (func $concat (type $6) (param externref externref) (result (ref extern))))
+
+  ;; CHECK:      (import "wasm:js-string" "intoCharCodeArray" (func $intoCharCodeArray (type $7) (param externref (ref null $0) i32) (result i32)))
 
   ;; CHECK:      (import "wasm:js-string" "equals" (func $equals (type $2) (param externref externref) (result i32)))
 
+  ;; CHECK:      (import "wasm:js-string" "test" (func $test (type $3) (param externref) (result i32)))
+
   ;; CHECK:      (import "wasm:js-string" "compare" (func $compare (type $2) (param externref externref) (result i32)))
 
-  ;; CHECK:      (import "wasm:js-string" "length" (func $length (type $7) (param externref) (result i32)))
+  ;; CHECK:      (import "wasm:js-string" "length" (func $length (type $3) (param externref) (result i32)))
 
   ;; CHECK:      (import "wasm:js-string" "charCodeAt" (func $charCodeAt (type $8) (param externref i32) (result i32)))
 
@@ -94,6 +98,9 @@
   ;; CHECK-NEXT:  (drop
   ;; CHECK-NEXT:   (string.const "unpaired low surrogate \ed\bd\88 ")
   ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT:  (drop
+  ;; CHECK-NEXT:   (string.const "z\\")
+  ;; CHECK-NEXT:  )
   ;; CHECK-NEXT: )
   (func $tricky-consts
     ;; These tricky strings should remain exactly the same after lowering and
@@ -109,6 +116,10 @@
     )
     (drop
       (string.const "unpaired low surrogate \ED\BD\88 ")
+    )
+    ;; A string with \", but the " is not escaped, as the \ is part of \\.
+    (drop
+      (string.const "z\\")
     )
   )
 )

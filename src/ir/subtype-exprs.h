@@ -19,6 +19,7 @@
 
 #include "ir/branch-utils.h"
 #include "wasm-traversal.h"
+#include "wasm-type.h"
 #include "wasm.h"
 
 namespace wasm {
@@ -52,8 +53,9 @@ namespace wasm {
 //                                          subtype of anothers, for example,
 //                                          a block and its last child.
 //
-//  * noteCast(HeapType, HeapType) - A fixed type is cast to another, for
-//                                   example, in a CallIndirect.
+//  * noteCast(HeapType, Type) - A fixed type is cast to another, for example,
+//                               in a CallIndirect. The destination is a Type
+//                               rather than HeapType because it may be exact.
 //  * noteCast(Expression, Type) - An expression's type is cast to a fixed type,
 //                                 for example, in RefTest.
 //  * noteCast(Expression, Expression) - An expression's type is cast to
@@ -131,6 +133,9 @@ struct SubtypingDiscoverer : public OverriddenVisitor<SubType> {
   void visitBreak(Break* curr) {
     if (curr->value) {
       self()->noteSubtype(curr->value, self()->findBreakTarget(curr->name));
+      if (curr->condition && curr->type != Type::unreachable) {
+        self()->noteSubtype(curr->value, curr);
+      }
     }
   }
   void visitSwitch(Switch* curr) {
@@ -165,7 +170,7 @@ struct SubtypingDiscoverer : public OverriddenVisitor<SubType> {
       //       this is a trivial situation that is not worth optimizing.
       self()->noteSubtype(tableType, curr->heapType);
     } else if (HeapType::isSubType(curr->heapType, tableType)) {
-      self()->noteCast(tableType, curr->heapType);
+      self()->noteCast(tableType, Type(curr->heapType, NonNullable, Inexact));
     } else {
       // The types are unrelated and the cast will fail. We can keep the types
       // unrelated.
@@ -188,6 +193,7 @@ struct SubtypingDiscoverer : public OverriddenVisitor<SubType> {
   void visitAtomicWait(AtomicWait* curr) {}
   void visitAtomicNotify(AtomicNotify* curr) {}
   void visitAtomicFence(AtomicFence* curr) {}
+  void visitPause(Pause* curr) {}
   void visitSIMDExtract(SIMDExtract* curr) {}
   void visitSIMDReplace(SIMDReplace* curr) {}
   void visitSIMDShuffle(SIMDShuffle* curr) {}
@@ -220,8 +226,15 @@ struct SubtypingDiscoverer : public OverriddenVisitor<SubType> {
   void visitRefIsNull(RefIsNull* curr) {}
   void visitRefFunc(RefFunc* curr) {}
   void visitRefEq(RefEq* curr) {
-    self()->noteNonFlowSubtype(curr->left, Type(HeapType::eq, Nullable));
-    self()->noteNonFlowSubtype(curr->right, Type(HeapType::eq, Nullable));
+    // Match the shareability of the current content (if it exists).
+    // TODO: This could also allow both sides to flip.
+    HeapType eq = HeapType::eq;
+    if (curr->type != Type::unreachable) {
+      eq = eq.getBasic(curr->left->type.getHeapType().getShared());
+    }
+    auto type = Type(eq, Nullable);
+    self()->noteNonFlowSubtype(curr->left, type);
+    self()->noteNonFlowSubtype(curr->right, type);
   }
   void visitTableGet(TableGet* curr) {}
   void visitTableSet(TableSet* curr) {
@@ -243,6 +256,7 @@ struct SubtypingDiscoverer : public OverriddenVisitor<SubType> {
     self()->noteSubtype(seg->type,
                         self()->getModule()->getTable(curr->table)->type);
   }
+  void visitElemDrop(ElemDrop* curr) {}
   void visitTry(Try* curr) {
     self()->noteSubtype(curr->body, curr);
     for (auto* body : curr->catchBodies) {
@@ -271,7 +285,15 @@ struct SubtypingDiscoverer : public OverriddenVisitor<SubType> {
   void visitI31Get(I31Get* curr) {
     // This could be |noteNonFlowSubtype| but as there are no subtypes of i31
     // it does not matter.
-    self()->noteSubtype(curr->i31, Type(HeapType::i31, Nullable));
+    // TODO: This should be i31 with a sharedness type variable, but we will
+    // have to refactor this to use principal types to represent that
+    // accurately. For now look at the operand to guess the proper sharedness.
+    auto share = Unshared;
+    if (curr->i31->type.isRef() && curr->i31->type.getHeapType().isShared()) {
+      share = Shared;
+    }
+    self()->noteSubtype(curr->i31,
+                        Type(HeapTypes::i31.getBasic(share), Nullable));
   }
   void visitCallRef(CallRef* curr) {
     // Even if we are unreachable, the target must be valid, and in particular
@@ -299,9 +321,18 @@ struct SubtypingDiscoverer : public OverriddenVisitor<SubType> {
     self()->noteCast(curr->ref, curr->castType);
   }
   void visitRefCast(RefCast* curr) { self()->noteCast(curr->ref, curr); }
+  void visitRefGetDesc(RefGetDesc* curr) {}
   void visitBrOn(BrOn* curr) {
-    if (curr->op == BrOnCast || curr->op == BrOnCastFail) {
-      self()->noteCast(curr->ref, curr->castType);
+    switch (curr->op) {
+      case BrOnNull:
+      case BrOnNonNull:
+        break;
+      case BrOnCast:
+      case BrOnCastFail:
+      case BrOnCastDesc:
+      case BrOnCastDescFail:
+        self()->noteCast(curr->ref, curr->castType);
+        break;
     }
     self()->noteSubtype(curr->getSentType(),
                         self()->findBreakTarget(curr->name));
@@ -336,8 +367,10 @@ struct SubtypingDiscoverer : public OverriddenVisitor<SubType> {
       return;
     }
     const auto& fields = curr->ref->type.getHeapType().getStruct().fields;
-    self()->noteSubtype(curr->expected, fields[curr->index].type);
-    self()->noteSubtype(curr->replacement, fields[curr->index].type);
+    auto type = fields[curr->index].type;
+    self()->noteSubtype(curr->expected,
+                        type.isRef() ? Type(HeapType::eq, Nullable) : type);
+    self()->noteSubtype(curr->replacement, type);
   }
   void visitArrayNew(ArrayNew* curr) {
     if (!curr->type.isArray() || curr->isWithDefault()) {
@@ -398,9 +431,36 @@ struct SubtypingDiscoverer : public OverriddenVisitor<SubType> {
     auto* seg = self()->getModule()->getElementSegment(curr->segment);
     self()->noteSubtype(seg->type, array.element.type);
   }
+  void visitArrayRMW(ArrayRMW* curr) {
+    if (!curr->ref->type.isArray()) {
+      return;
+    }
+    auto array = curr->ref->type.getHeapType().getArray();
+    self()->noteSubtype(curr->value, array.element.type);
+  }
+  void visitArrayCmpxchg(ArrayCmpxchg* curr) {
+    if (!curr->ref->type.isArray()) {
+      return;
+    }
+    auto type = curr->ref->type.getHeapType().getArray().element.type;
+    self()->noteSubtype(curr->expected,
+                        type.isRef() ? Type(HeapType::eq, Nullable) : type);
+    self()->noteSubtype(curr->replacement, type);
+  }
   void visitRefAs(RefAs* curr) {
-    if (curr->op == RefAsNonNull) {
-      self()->noteCast(curr->value, curr);
+    switch (curr->op) {
+      case RefAsNonNull:
+        self()->noteCast(curr->value, curr);
+        return;
+      case AnyConvertExtern:
+        return;
+      case ExternConvertAny:
+        if (curr->type != Type::unreachable) {
+          auto any =
+            HeapTypes::any.getBasic(curr->type.getHeapType().getShared());
+          self()->noteSubtype(curr->value, Type(any, Nullable));
+        }
+        return;
     }
   }
   void visitStringNew(StringNew* curr) {}
@@ -409,18 +469,134 @@ struct SubtypingDiscoverer : public OverriddenVisitor<SubType> {
   void visitStringEncode(StringEncode* curr) {}
   void visitStringConcat(StringConcat* curr) {}
   void visitStringEq(StringEq* curr) {}
+  void visitStringTest(StringTest* curr) {}
   void visitStringWTF16Get(StringWTF16Get* curr) {}
   void visitStringSliceWTF(StringSliceWTF* curr) {}
 
-  void visitContNew(ContNew* curr) { WASM_UNREACHABLE("not implemented"); }
-  void visitContBind(ContBind* curr) { WASM_UNREACHABLE("not implemented"); }
-  void visitSuspend(Suspend* curr) { WASM_UNREACHABLE("not implemented"); }
-  void visitResume(Resume* curr) { WASM_UNREACHABLE("not implemented"); }
+  void visitContNew(ContNew* curr) {
+    if (!curr->type.isContinuation()) {
+      return;
+    }
+    // The type of the function reference must remain a subtype of the function
+    // type expected by the continuation.
+    self()->noteSubtype(curr->func->type.getHeapType(),
+                        curr->type.getHeapType().getContinuation().type);
+  }
+  void visitContBind(ContBind* curr) {
+    if (!curr->cont->type.isContinuation()) {
+      return;
+    }
+    // Each of the bound arguments must remain subtypes of their expected
+    // parameters.
+    auto params = curr->cont->type.getHeapType()
+                    .getContinuation()
+                    .type.getSignature()
+                    .params;
+    assert(curr->operands.size() <= params.size());
+    for (Index i = 0; i < curr->operands.size(); ++i) {
+      self()->noteSubtype(curr->operands[i], params[i]);
+    }
+  }
+  void visitSuspend(Suspend* curr) {
+    // The operands must remain subtypes of the parameters given by the tag.
+    auto params =
+      self()->getModule()->getTag(curr->tag)->type.getSignature().params;
+    assert(curr->operands.size() == params.size());
+    for (Index i = 0; i < curr->operands.size(); ++i) {
+      self()->noteSubtype(curr->operands[i], params[i]);
+    }
+  }
+  void processResumeHandlers(Type contType,
+                             const ArenaVector<Name>& handlerTags,
+                             const ArenaVector<Name>& handlerBlocks) {
+    auto contSig = contType.getHeapType().getContinuation().type.getSignature();
+    assert(handlerTags.size() == handlerBlocks.size());
+    auto& wasm = *self()->getModule();
+    // Process each handler in turn.
+    for (Index i = 0; i < handlerTags.size(); ++i) {
+      if (!handlerBlocks[i]) {
+        // Switch handlers do not constrain types in any way.
+        continue;
+      }
+      auto tagSig = wasm.getTag(handlerTags[i])->type.getSignature();
+      // The types sent on suspensions with this tag must remain subtypes of the
+      // types expected at the target block.
+      auto expected = self()->findBreakTarget(handlerBlocks[i])->type;
+      assert(tagSig.params.size() + 1 == expected.size());
+      for (Index j = 0; j < tagSig.params.size(); ++j) {
+        self()->noteSubtype(tagSig.params[i], expected[i]);
+      }
+      auto nextSig = expected[expected.size() - 1]
+                       .getHeapType()
+                       .getContinuation()
+                       .type.getSignature();
+      // The types we send to the next continuation must remain subtypes of the
+      // types the continuation is expecting based on the tag results.
+      self()->noteSubtype(nextSig.params, tagSig.results);
+      // The types returned by the current continuation must remain subtypes of
+      // the types returned by the next continuation.
+      self()->noteSubtype(contSig.results, nextSig.results);
+    }
+  }
+  void visitResume(Resume* curr) {
+    if (!curr->cont->type.isContinuation()) {
+      return;
+    }
+    processResumeHandlers(
+      curr->cont->type, curr->handlerTags, curr->handlerBlocks);
+    // The types we send to the resumed continuation must remain subtypes of the
+    // types expected by the continuation.
+    auto params = curr->cont->type.getHeapType()
+                    .getContinuation()
+                    .type.getSignature()
+                    .params;
+    assert(curr->operands.size() == params.size());
+    for (Index i = 0; i < curr->operands.size(); ++i) {
+      self()->noteSubtype(curr->operands[i], params[i]);
+    }
+  }
   void visitResumeThrow(ResumeThrow* curr) {
-    WASM_UNREACHABLE("not implemented");
+    if (!curr->cont->type.isContinuation()) {
+      return;
+    }
+    processResumeHandlers(
+      curr->cont->type, curr->handlerTags, curr->handlerBlocks);
+
+    if (curr->tag) {
+      // The types we use to create the exception package must remain subtypes
+      // of the types expected by the exception tag.
+      auto params =
+        self()->getModule()->getTag(curr->tag)->type.getSignature().params;
+      assert(curr->operands.size() == params.size());
+      for (Index i = 0; i < curr->operands.size(); ++i) {
+        self()->noteSubtype(curr->operands[i], params[i]);
+      }
+    }
   }
   void visitStackSwitch(StackSwitch* curr) {
-    WASM_UNREACHABLE("not implemented");
+    if (!curr->cont->type.isContinuation()) {
+      return;
+    }
+    // The types sent when switching must remain subtypes of the types expected
+    // by the target continuation.
+    auto contSig =
+      curr->cont->type.getHeapType().getContinuation().type.getSignature();
+    assert(curr->operands.size() + 1 == contSig.params.size());
+    for (Index i = 0; i < curr->operands.size(); ++i) {
+      self()->noteSubtype(curr->operands[i], contSig.params[i]);
+    }
+    // The type returned by the target continuation must remain a subtype of the
+    // type the current continuation returns as indicated by the tag result.
+    auto currResult =
+      self()->getModule()->getTag(curr->tag)->type.getSignature().results;
+    self()->noteSubtype(contSig.results, currResult);
+    // The type returned by the current continuation must remain a subtype of
+    // the type returned by the return continuation.
+    auto retSig = contSig.params[contSig.params.size() - 1]
+                    .getHeapType()
+                    .getContinuation()
+                    .type.getSignature();
+    self()->noteSubtype(currResult, retSig.results);
   }
 };
 

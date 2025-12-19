@@ -44,6 +44,7 @@ struct StringLifting : public Pass {
   Name fromCodePointImport;
   Name concatImport;
   Name equalsImport;
+  Name testImport;
   Name compareImport;
   Name lengthImport;
   Name charCodeAtImport;
@@ -79,41 +80,45 @@ struct StringLifting : public Pass {
     }
 
     // Imported strings may also be found in the string section.
-    for (auto& section : module->customSections) {
-      if (section.name == "string.consts") {
-        // We found the string consts section. Parse it.
-        auto copy = section.data;
-        json::Value array;
-        array.parse(copy.data(), json::Value::WTF16);
-        if (!array.isArray()) {
-          Fatal()
-            << "StringLifting: string.const section should be a JSON array";
-        }
-
-        // We have the array of constants from the section. Find globals that
-        // refer to it.
-        for (auto& global : module->globals) {
-          if (!global->imported() || global->module != "string.const") {
-            continue;
-          }
-          // The index in the array is the basename.
-          Index index = std::stoi(std::string(global->base.str));
-          if (index >= array.size()) {
-            Fatal() << "StringLifting: bad index in string.const section";
-          }
-          auto item = array[index];
-          if (!item->isString()) {
-            Fatal()
-              << "StringLifting: string.const section entry is not a string";
-          }
-          if (importedStrings.count(global->name)) {
-            Fatal()
-              << "StringLifting: string.const section tramples other const";
-          }
-          importedStrings[global->name] = item->getIString();
-        }
-        break;
+    auto stringSectionIter = std::find_if(
+      module->customSections.begin(),
+      module->customSections.end(),
+      [&](CustomSection& section) { return section.name == "string.consts"; });
+    if (stringSectionIter != module->customSections.end()) {
+      // We found the string consts section. Parse it.
+      auto& section = *stringSectionIter;
+      auto copy = section.data;
+      json::Value array;
+      array.parse(copy.data(), json::Value::WTF16);
+      if (!array.isArray()) {
+        Fatal() << "StringLifting: string.const section should be a JSON array";
       }
+
+      // We have the array of constants from the section. Find globals that
+      // refer to it.
+      for (auto& global : module->globals) {
+        if (!global->imported() || global->module != "string.const") {
+          continue;
+        }
+        // The index in the array is the basename.
+        Index index = std::stoi(std::string(global->base.str));
+        if (index >= array.size()) {
+          Fatal() << "StringLifting: bad index in string.const section";
+        }
+        auto item = array[index];
+        if (!item->isString()) {
+          Fatal()
+            << "StringLifting: string.const section entry is not a string";
+        }
+        if (importedStrings.count(global->name)) {
+          Fatal() << "StringLifting: string.const section tramples other const";
+        }
+        importedStrings[global->name] = item->getIString();
+      }
+
+      // Remove the custom section: After lifting it has no purpose (and could
+      // cause problems with repeated lifting/lowering).
+      module->customSections.erase(stringSectionIter);
     }
 
     auto array16 = Type(Array(Field(Field::i16, Mutable)), Nullable);
@@ -126,60 +131,66 @@ struct StringLifting : public Pass {
       if (!func->imported() || func->module != WasmStringsModule) {
         continue;
       }
-      auto sig = func->type.getSignature();
+      // TODO: Check exactness here too.
+      auto type = func->type;
       if (func->base == "fromCharCodeArray") {
-        if (sig != Signature({array16, i32, i32}, refExtern)) {
-          Fatal() << "StringLifting: bad signature for fromCharCodeArray: "
-                  << sig;
+        if (type.getHeapType() != Signature({array16, i32, i32}, refExtern)) {
+          Fatal() << "StringLifting: bad type for fromCharCodeArray: " << type;
         }
         fromCharCodeArrayImport = func->name;
         found = true;
       } else if (func->base == "fromCodePoint") {
-        if (sig != Signature(i32, refExtern)) {
-          Fatal() << "StringLifting: bad signature for fromCodePoint: " << sig;
+        if (type.getHeapType() != Signature(i32, refExtern)) {
+          Fatal() << "StringLifting: bad type for fromCodePoint: " << type;
         }
         fromCodePointImport = func->name;
         found = true;
       } else if (func->base == "concat") {
-        if (sig != Signature({externref, externref}, refExtern)) {
-          Fatal() << "StringLifting: bad signature for concta: " << sig;
+        if (type.getHeapType() !=
+            Signature({externref, externref}, refExtern)) {
+          Fatal() << "StringLifting: bad type for concat: " << type;
         }
         concatImport = func->name;
         found = true;
       } else if (func->base == "intoCharCodeArray") {
-        if (sig != Signature({externref, array16, i32}, i32)) {
-          Fatal() << "StringLifting: bad signature for intoCharCodeArray: "
-                  << sig;
+        if (type.getHeapType() != Signature({externref, array16, i32}, i32)) {
+          Fatal() << "StringLifting: bad type for intoCharCodeArray: " << type;
         }
         intoCharCodeArrayImport = func->name;
         found = true;
       } else if (func->base == "equals") {
-        if (sig != Signature({externref, externref}, i32)) {
-          Fatal() << "StringLifting: bad signature for equals: " << sig;
+        if (type.getHeapType() != Signature({externref, externref}, i32)) {
+          Fatal() << "StringLifting: bad type for equals: " << type;
         }
         equalsImport = func->name;
         found = true;
+      } else if (func->base == "test") {
+        if (type.getHeapType() != Signature({externref}, i32)) {
+          Fatal() << "StringLifting: bad type for test: " << type;
+        }
+        testImport = func->name;
+        found = true;
       } else if (func->base == "compare") {
-        if (sig != Signature({externref, externref}, i32)) {
-          Fatal() << "StringLifting: bad signature for compare: " << sig;
+        if (type.getHeapType() != Signature({externref, externref}, i32)) {
+          Fatal() << "StringLifting: bad type for compare: " << type;
         }
         compareImport = func->name;
         found = true;
       } else if (func->base == "length") {
-        if (sig != Signature({externref}, i32)) {
-          Fatal() << "StringLifting: bad signature for length: " << sig;
+        if (type.getHeapType() != Signature({externref}, i32)) {
+          Fatal() << "StringLifting: bad type for length: " << type;
         }
         lengthImport = func->name;
         found = true;
       } else if (func->base == "charCodeAt") {
-        if (sig != Signature({externref, i32}, i32)) {
-          Fatal() << "StringLifting: bad signature for charCodeAt: " << sig;
+        if (type.getHeapType() != Signature({externref, i32}, i32)) {
+          Fatal() << "StringLifting: bad type for charCodeAt: " << type;
         }
         charCodeAtImport = func->name;
         found = true;
       } else if (func->base == "substring") {
-        if (sig != Signature({externref, i32, i32}, refExtern)) {
-          Fatal() << "StringLifting: bad signature for substring: " << sig;
+        if (type.getHeapType() != Signature({externref, i32, i32}, refExtern)) {
+          Fatal() << "StringLifting: bad type for substring: " << type;
         }
         substringImport = func->name;
         found = true;
@@ -243,6 +254,9 @@ struct StringLifting : public Pass {
                            .makeStringEq(StringEqEqual,
                                          curr->operands[0],
                                          curr->operands[1]));
+        } else if (curr->target == parent.testImport) {
+          replaceCurrent(
+            Builder(*getModule()).makeStringTest(curr->operands[0]));
         } else if (curr->target == parent.compareImport) {
           replaceCurrent(Builder(*getModule())
                            .makeStringEq(StringEqCompare,

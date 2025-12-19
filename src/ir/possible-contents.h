@@ -40,10 +40,11 @@ namespace wasm {
 //
 //  * Literal:         One possible constant value like an i32 of 42.
 //
-//  * Global:          The name of a global whose value is here. We do not know
-//                     the actual value at compile time, but we know it is equal
-//                     to that global. Typically we can only infer this for
-//                     immutable globals.
+//  * Global:          An immutable global value, something who we can identify
+//                     but do not know the actual value of at runtime. This can
+//                     be either a wasm (immutable) Global, or an imported wasm
+//                     Function (which is effectively the same: we can refer to
+//                     it, but do not know what is being imported there).
 //
 //  * ConeType:        Any possible value of a particular type, and a possible
 //                     "cone" of a certain depth below it. If the depth is 0
@@ -85,6 +86,7 @@ class PossibleContents {
 
   struct GlobalInfo {
     Name name;
+    ExternalKind kind;
     // The type of contents. Note that this may not match the type of the
     // global, if we were filtered. For example:
     //
@@ -99,7 +101,7 @@ class PossibleContents {
     //       way. In principle, not having depth info can lead to loss of
     //       precision.
     bool operator==(const GlobalInfo& other) const {
-      return name == other.name && type == other.type;
+      return name == other.name && kind == other.kind && type == other.type;
     }
   };
 
@@ -126,9 +128,12 @@ class PossibleContents {
 
   static constexpr Index FullDepth = -1;
 
-  // Internal convenience for creating a cone type of unbounded depth, i.e., the
-  // full cone of all subtypes for that type.
-  static ConeType FullConeType(Type type) { return ConeType{type, FullDepth}; }
+  // Internal convenience for creating a cone type carrying no information
+  // besides the type. For exact references, the depth is 0 and for all other
+  // types the depth is unbounded and includes all possible subtypes.
+  static ConeType DefaultConeType(Type type) {
+    return type.isExact() ? ExactType(type) : ConeType{type, FullDepth};
+  }
 
   template<typename T> PossibleContents(T value) : value(value) {}
 
@@ -141,17 +146,18 @@ public:
 
   static PossibleContents none() { return PossibleContents{None()}; }
   static PossibleContents literal(Literal c) { return PossibleContents{c}; }
-  static PossibleContents global(Name name, Type type) {
-    return PossibleContents{GlobalInfo{name, type}};
+  static PossibleContents global(Name name, ExternalKind kind, Type type) {
+    return PossibleContents{GlobalInfo{name, kind, type}};
   }
   // Helper for a cone type with depth 0, i.e., an exact type.
   static PossibleContents exactType(Type type) {
     return PossibleContents{ExactType(type)};
   }
-  // Helper for a cone with unbounded depth, i.e., the full cone of all subtypes
-  // for that type.
-  static PossibleContents fullConeType(Type type) {
-    return PossibleContents{FullConeType(type)};
+  // Helper for a cone with default depth for the given type. For exact
+  // references this is depth 0 and for all other this tyis is unbounded depth
+  // and includes all possible subtypes.
+  static PossibleContents coneType(Type type) {
+    return PossibleContents{DefaultConeType(type)};
   }
   static PossibleContents coneType(Type type, Index depth) {
     return PossibleContents{ConeType{type, depth}};
@@ -165,7 +171,7 @@ public:
 
     if (type.isRef()) {
       // For a reference, subtyping matters.
-      return fullConeType(type);
+      return coneType(type);
     }
 
     if (type == Type::unreachable) {
@@ -212,9 +218,9 @@ public:
     return std::get<Literal>(value);
   }
 
-  Name getGlobal() const {
+  GlobalInfo getGlobal() const {
     assert(isGlobal());
-    return std::get<GlobalInfo>(value).name;
+    return std::get<GlobalInfo>(value);
   }
 
   bool isNull() const { return isLiteral() && getLiteral().isNull(); }
@@ -251,7 +257,7 @@ public:
     if (auto* literal = std::get_if<Literal>(&value)) {
       return ExactType(literal->type);
     } else if (auto* global = std::get_if<GlobalInfo>(&value)) {
-      return FullConeType(global->type);
+      return DefaultConeType(global->type);
     } else if (auto* coneType = std::get_if<ConeType>(&value)) {
       return *coneType;
     } else if (std::get_if<None>(&value)) {
@@ -312,11 +318,17 @@ public:
     if (isLiteral()) {
       return builder.makeConstantExpression(getLiteral());
     } else {
-      auto name = getGlobal();
+      auto info = getGlobal();
       // Note that we load the type from the module, rather than use the type
       // in the GlobalInfo, as that type may not match the global (see comment
       // in the GlobalInfo declaration above).
-      return builder.makeGlobalGet(name, wasm.getGlobal(name)->type);
+      if (info.kind == ExternalKind::Global) {
+        return builder.makeGlobalGet(info.name,
+                                     wasm.getGlobal(info.name)->type);
+      } else {
+        assert(info.kind == ExternalKind::Function);
+        return builder.makeRefFunc(info.name);
+      }
     }
   }
 
@@ -328,12 +340,12 @@ public:
       WASM_UNREACHABLE("TODO: use Literals");
     } else if (std::get_if<GlobalInfo>(&value)) {
       WASM_UNREACHABLE("TODO");
-    } else if (auto* cone = std::get_if<ConeType>(&value)) {
+    } else if ([[maybe_unused]] auto* cone = std::get_if<ConeType>(&value)) {
       // Return a full cone of the appropriate type, as we lack depth info for
       // the separate items in the tuple (tuples themselves have no subtyping,
       // so the tuple's depth must be 0, i.e., an exact type).
       assert(cone->depth == 0);
-      return fullConeType(type[i]);
+      return coneType(type[i]);
     } else {
       WASM_UNREACHABLE("not a tuple");
     }
@@ -348,6 +360,7 @@ public:
       rehash(ret, getLiteral());
     } else if (auto* global = std::get_if<GlobalInfo>(&value)) {
       rehash(ret, global->name);
+      rehash(ret, global->kind);
       rehash(ret, global->type);
     } else if (auto* coneType = std::get_if<ConeType>(&value)) {
       rehash(ret, coneType->type);
@@ -370,7 +383,9 @@ public:
         o << " HT: " << h;
       }
     } else if (isGlobal()) {
-      o << "GlobalInfo $" << getGlobal() << " T: " << getType();
+      auto info = getGlobal();
+      o << "GlobalInfo $" << info.name << " K: " << int(info.kind)
+        << " T: " << getType();
     } else if (auto* coneType = std::get_if<ConeType>(&value)) {
       auto t = coneType->type;
       o << "ConeType " << t;
@@ -477,7 +492,9 @@ struct SignatureResultLocation {
 struct DataLocation {
   HeapType type;
   // The index of the field in a struct, or 0 for an array (where we do not
-  // attempt to differentiate by index).
+  // attempt to differentiate by index). A special index is used for the
+  // descriptor field.
+  static const Index DescriptorIndex = -1;
   Index index;
   bool operator==(const DataLocation& other) const {
     return type == other.type && index == other.index;
@@ -496,20 +513,22 @@ struct TagLocation {
   }
 };
 
-// The location of an exnref materialized by a catch_ref or catch_all_ref clause
-// of a try_table. No data is stored here. exnrefs contain a tag and a payload
-// at run-time, as well as potential metadata such as stack traces, but we don't
-// track that. So this is the same as NullLocation in a way: we just need *a*
-// source of contents for places that receive an exnref.
-struct CaughtExnRefLocation {
-  bool operator==(const CaughtExnRefLocation& other) const { return true; }
-};
-
-// A null value. This is used as the location of the default value of a var in a
-// function, a null written to a struct field in struct.new_with_default, etc.
+// A null value of a particular type. For example, a nullable local reads from
+// the corresponding NullLocation, for its default value.
 struct NullLocation {
   Type type;
   bool operator==(const NullLocation& other) const {
+    return type == other.type;
+  }
+};
+
+// A location that contains anything of a particular type. This is used as a
+// root of the graph, a source of values we will never learn anything about, and
+// must assume they can be anything of that type (e.g., the return of a call to
+// an import).
+struct TypeLocation {
+  Type type;
+  bool operator==(const TypeLocation& other) const {
     return type == other.type;
   }
 };
@@ -551,8 +570,8 @@ using Location = std::variant<ExpressionLocation,
                               SignatureResultLocation,
                               DataLocation,
                               TagLocation,
-                              CaughtExnRefLocation,
                               NullLocation,
+                              TypeLocation,
                               ConeReadLocation>;
 
 } // namespace wasm
@@ -633,14 +652,14 @@ template<> struct hash<wasm::TagLocation> {
   }
 };
 
-template<> struct hash<wasm::CaughtExnRefLocation> {
-  size_t operator()(const wasm::CaughtExnRefLocation& loc) const {
-    return std::hash<const void*>()("caught-exnref-location");
+template<> struct hash<wasm::NullLocation> {
+  size_t operator()(const wasm::NullLocation& loc) const {
+    return std::hash<wasm::Type>{}(loc.type);
   }
 };
 
-template<> struct hash<wasm::NullLocation> {
-  size_t operator()(const wasm::NullLocation& loc) const {
+template<> struct hash<wasm::TypeLocation> {
+  size_t operator()(const wasm::TypeLocation& loc) const {
     return std::hash<wasm::Type>{}(loc.type);
   }
 };

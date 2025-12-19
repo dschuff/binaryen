@@ -246,7 +246,7 @@
   )
 
   ;; CHECK:      (func $multiple-iterations-refinalize-call-ref (type $0)
-  ;; CHECK-NEXT:  (local $f (ref $ret-i31))
+  ;; CHECK-NEXT:  (local $f (ref (exact $ret-i31)))
   ;; CHECK-NEXT:  (local $x i31ref)
   ;; CHECK-NEXT:  (local.set $f
   ;; CHECK-NEXT:   (ref.func $ret-i31)
@@ -332,7 +332,7 @@
   )
 
   ;; CHECK:      (func $uses-default (type $2) (param $i i32)
-  ;; CHECK-NEXT:  (local $x (ref null $2))
+  ;; CHECK-NEXT:  (local $x (ref null (exact $2)))
   ;; CHECK-NEXT:  (if
   ;; CHECK-NEXT:   (local.get $i)
   ;; CHECK-NEXT:   (then
@@ -362,13 +362,13 @@
   )
 
   ;; CHECK:      (func $unreachables (type $3) (result funcref)
-  ;; CHECK-NEXT:  (local $temp (ref $3))
+  ;; CHECK-NEXT:  (local $temp (ref (exact $3)))
   ;; CHECK-NEXT:  (local.set $temp
   ;; CHECK-NEXT:   (ref.func $unreachables)
   ;; CHECK-NEXT:  )
   ;; CHECK-NEXT:  (unreachable)
   ;; CHECK-NEXT:  (drop
-  ;; CHECK-NEXT:   (block (result (ref $3))
+  ;; CHECK-NEXT:   (block (result (ref (exact $3)))
   ;; CHECK-NEXT:    (local.tee $temp
   ;; CHECK-NEXT:     (ref.func $unreachables)
   ;; CHECK-NEXT:    )
@@ -397,7 +397,7 @@
   )
 
   ;; CHECK:      (func $incompatible-sets (type $1) (result i32)
-  ;; CHECK-NEXT:  (local $temp (ref null $1))
+  ;; CHECK-NEXT:  (local $temp (ref null (exact $1)))
   ;; CHECK-NEXT:  (local.set $temp
   ;; CHECK-NEXT:   (ref.func $incompatible-sets)
   ;; CHECK-NEXT:  )
@@ -435,7 +435,7 @@
   )
 
   ;; CHECK:      (func $become-non-nullable (type $0)
-  ;; CHECK-NEXT:  (local $x (ref $0))
+  ;; CHECK-NEXT:  (local $x (ref (exact $0)))
   ;; CHECK-NEXT:  (local.set $x
   ;; CHECK-NEXT:   (ref.func $become-non-nullable)
   ;; CHECK-NEXT:  )
@@ -454,7 +454,7 @@
   )
 
   ;; CHECK:      (func $already-non-nullable (type $0)
-  ;; CHECK-NEXT:  (local $x (ref $0))
+  ;; CHECK-NEXT:  (local $x (ref (exact $0)))
   ;; CHECK-NEXT:  (local.set $x
   ;; CHECK-NEXT:   (ref.func $already-non-nullable)
   ;; CHECK-NEXT:  )
@@ -473,7 +473,7 @@
   )
 
   ;; CHECK:      (func $cannot-become-non-nullable (type $0)
-  ;; CHECK-NEXT:  (local $x (ref null $0))
+  ;; CHECK-NEXT:  (local $x (ref null (exact $0)))
   ;; CHECK-NEXT:  (if
   ;; CHECK-NEXT:   (i32.const 1)
   ;; CHECK-NEXT:   (then
@@ -505,7 +505,7 @@
   )
 
   ;; CHECK:      (func $cannot-become-non-nullable-block (type $0)
-  ;; CHECK-NEXT:  (local $x (ref null $0))
+  ;; CHECK-NEXT:  (local $x (ref null (exact $0)))
   ;; CHECK-NEXT:  (block $name
   ;; CHECK-NEXT:   (br_if $name
   ;; CHECK-NEXT:    (i32.const 1)
@@ -536,7 +536,7 @@
   )
 
   ;; CHECK:      (func $become-non-nullable-block-unnamed (type $0)
-  ;; CHECK-NEXT:  (local $x (ref $0))
+  ;; CHECK-NEXT:  (local $x (ref (exact $0)))
   ;; CHECK-NEXT:  (block
   ;; CHECK-NEXT:   (local.set $x
   ;; CHECK-NEXT:    (ref.func $become-non-nullable)

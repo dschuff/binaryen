@@ -417,6 +417,7 @@ struct TransferFn : OverriddenVisitor<TransferFn> {
   void visitAtomicWait(AtomicWait* curr) {}
   void visitAtomicNotify(AtomicNotify* curr) {}
   void visitAtomicFence(AtomicFence* curr) {}
+  void visitPause(Pause* curr) {}
   void visitSIMDExtract(SIMDExtract* curr) {}
   void visitSIMDReplace(SIMDReplace* curr) {}
   void visitSIMDShuffle(SIMDShuffle* curr) {}
@@ -500,6 +501,8 @@ struct TransferFn : OverriddenVisitor<TransferFn> {
   }
 
   void visitTableInit(TableInit* curr) {}
+
+  void visitElemDrop(ElemDrop* curr) {}
 
   void visitTry(Try* curr) { WASM_UNREACHABLE("TODO"); }
   void visitTryTable(TryTable* curr) { WASM_UNREACHABLE("TODO"); }
@@ -594,6 +597,8 @@ struct TransferFn : OverriddenVisitor<TransferFn> {
     pop();
     push(Type::none);
   }
+
+  void visitRefGetDesc(RefGetDesc* curr) { WASM_UNREACHABLE("TODO"); }
 
   void visitBrOn(BrOn* curr) {
     // Like br_if, these instructions do different things to the stack depending
@@ -724,6 +729,10 @@ struct TransferFn : OverriddenVisitor<TransferFn> {
       }
     }
   }
+
+  void visitArrayRMW(ArrayRMW* curr) { WASM_UNREACHABLE("TODO"); }
+
+  void visitArrayCmpxchg(ArrayCmpxchg* curr) { WASM_UNREACHABLE("TODO"); }
 
   HeapType
   generalizeArrayType(HeapType type,
@@ -872,6 +881,7 @@ struct TransferFn : OverriddenVisitor<TransferFn> {
   void visitStringEncode(StringEncode* curr) { WASM_UNREACHABLE("TODO"); }
   void visitStringConcat(StringConcat* curr) { WASM_UNREACHABLE("TODO"); }
   void visitStringEq(StringEq* curr) { WASM_UNREACHABLE("TODO"); }
+  void visitStringTest(StringTest* curr) { WASM_UNREACHABLE("TODO"); }
   void visitStringWTF16Get(StringWTF16Get* curr) { WASM_UNREACHABLE("TODO"); }
   void visitStringSliceWTF(StringSliceWTF* curr) { WASM_UNREACHABLE("TODO"); }
 

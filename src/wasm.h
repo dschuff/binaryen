@@ -608,6 +608,8 @@ enum BrOnOp {
   BrOnNonNull,
   BrOnCast,
   BrOnCastFail,
+  BrOnCastDesc,
+  BrOnCastDescFail,
 };
 
 enum StringNewOp {
@@ -683,6 +685,7 @@ public:
     AtomicWaitId,
     AtomicNotifyId,
     AtomicFenceId,
+    PauseId,
     SIMDExtractId,
     SIMDReplaceId,
     SIMDShuffleId,
@@ -706,6 +709,7 @@ public:
     TableFillId,
     TableCopyId,
     TableInitId,
+    ElemDropId,
     TryId,
     TryTableId,
     ThrowId,
@@ -718,6 +722,7 @@ public:
     CallRefId,
     RefTestId,
     RefCastId,
+    RefGetDescId,
     BrOnId,
     StructNewId,
     StructGetId,
@@ -735,6 +740,8 @@ public:
     ArrayFillId,
     ArrayInitDataId,
     ArrayInitElemId,
+    ArrayRMWId,
+    ArrayCmpxchgId,
     RefAsId,
     StringNewId,
     StringConstId,
@@ -742,6 +749,7 @@ public:
     StringEncodeId,
     StringConcatId,
     StringEqId,
+    StringTestId,
     StringWTF16GetId,
     StringSliceWTFId,
     ContNewId,
@@ -1078,8 +1086,12 @@ public:
   // other orderings may be added in the future. This field is reserved for
   // that, and currently set to 0.
   uint8_t order = 0;
+};
 
-  void finalize();
+class Pause : public SpecificExpression<Expression::PauseId> {
+public:
+  Pause() = default;
+  Pause(MixedArena& allocator) {}
 };
 
 class SIMDExtract : public SpecificExpression<Expression::SIMDExtractId> {
@@ -1364,7 +1376,7 @@ public:
   Name func;
 
   void finalize();
-  void finalize(HeapType heapType);
+  void finalize(Module& wasm);
 };
 
 class RefEq : public SpecificExpression<Expression::RefEqId> {
@@ -1462,6 +1474,16 @@ public:
   Expression* offset;
   Expression* size;
   Name table;
+
+  void finalize();
+};
+
+class ElemDrop : public SpecificExpression<Expression::ElemDropId> {
+public:
+  ElemDrop() = default;
+  ElemDrop(MixedArena& allocator) : ElemDrop() {}
+
+  Name segment;
 
   void finalize();
 };
@@ -1617,9 +1639,22 @@ public:
 
   Expression* ref;
 
+  // Used only for ref.cast_desc.
+  Expression* desc;
+
   void finalize();
 
   Type& getCastType() { return type; }
+};
+
+class RefGetDesc : public SpecificExpression<Expression::RefGetDescId> {
+public:
+  RefGetDesc() = default;
+  RefGetDesc(MixedArena& allocator) {}
+
+  Expression* ref;
+
+  void finalize();
 };
 
 class BrOn : public SpecificExpression<Expression::BrOnId> {
@@ -1630,6 +1665,11 @@ public:
   BrOnOp op;
   Name name;
   Expression* ref;
+
+  // Only used for br_on_cast_desc{,_fail}
+  Expression* desc;
+
+  // Only used for br_on_cast{,_desc}{,_fail}
   Type castType;
 
   void finalize();
@@ -1648,6 +1688,8 @@ public:
   // struct with no fields ambiguous, but it doesn't make a difference in that
   // case, and binaryen doesn't guarantee roundtripping binaries anyhow.
   ExpressionList operands;
+
+  Expression* desc = nullptr;
 
   bool isWithDefault() { return operands.empty(); }
 
@@ -1767,6 +1809,7 @@ public:
   Expression* index;
   // Packed fields have a sign.
   bool signed_ = false;
+  MemoryOrder order = MemoryOrder::Unordered;
 
   void finalize();
 };
@@ -1779,6 +1822,7 @@ public:
   Expression* ref;
   Expression* index;
   Expression* value;
+  MemoryOrder order = MemoryOrder::Unordered;
 
   void finalize();
 };
@@ -1844,6 +1888,34 @@ public:
   Expression* index;
   Expression* offset;
   Expression* size;
+
+  void finalize();
+};
+
+class ArrayRMW : public SpecificExpression<Expression::ArrayRMWId> {
+public:
+  ArrayRMW() = default;
+  ArrayRMW(MixedArena& allocator) {}
+
+  AtomicRMWOp op;
+  Expression* ref;
+  Expression* index;
+  Expression* value;
+  MemoryOrder order;
+
+  void finalize();
+};
+
+class ArrayCmpxchg : public SpecificExpression<Expression::ArrayCmpxchgId> {
+public:
+  ArrayCmpxchg() = default;
+  ArrayCmpxchg(MixedArena& allocator) {}
+
+  Expression* ref;
+  Expression* index;
+  Expression* expected;
+  Expression* replacement;
+  MemoryOrder order;
 
   void finalize();
 };
@@ -1940,6 +2012,16 @@ public:
   void finalize();
 };
 
+class StringTest : public SpecificExpression<Expression::StringTestId> {
+public:
+  StringTest() = default;
+  StringTest(MixedArena& allocator) {}
+
+  Expression* ref;
+
+  void finalize();
+};
+
 class StringWTF16Get : public SpecificExpression<Expression::StringWTF16GetId> {
 public:
   StringWTF16Get() = default;
@@ -2032,6 +2114,9 @@ public:
     : handlerTags(allocator), handlerBlocks(allocator), operands(allocator),
       sentTypes(allocator) {}
 
+  // If tag is set to a non-null Name, this is a resume_throw and |operands|
+  // contains the values to be set in an exception of that tag. If tag is null,
+  // this is resume_throw_ref and |operands| contains a single item, the exnref.
   Name tag;
   // See the comment on `Resume` above.
   ArenaVector<Name> handlerTags;
@@ -2142,7 +2227,9 @@ class EffectAnalyzer;
 
 class Function : public Importable {
 public:
-  HeapType type = HeapType(Signature()); // parameters and return value
+  // A non-nullable reference to a function type. Exact for defined functions.
+  // TODO: Inexact for imported functions.
+  Type type = Type(Signature(), NonNullable, Exact);
   IRProfile profile = IRProfile::Normal;
   std::vector<Type> vars; // non-param locals
 
@@ -2156,7 +2243,7 @@ public:
   // Source maps debugging info: map expression nodes to their file, line, col,
   // symbol name.
   struct DebugLocation {
-    BinaryLocation fileIndex, lineNumber, columnNumber;
+    BinaryLocation fileIndex = -1, lineNumber = -1, columnNumber = -1;
     std::optional<BinaryLocation> symbolNameIndex;
     bool operator==(const DebugLocation& other) const {
       return fileIndex == other.fileIndex && lineNumber == other.lineNumber &&
@@ -2173,6 +2260,11 @@ public:
                ? columnNumber < other.columnNumber
                : symbolNameIndex < other.symbolNameIndex;
     }
+    void dump() {
+      std::cerr << (symbolNameIndex ? symbolNameIndex.value() : -1) << " @ "
+                << fileIndex << ":" << lineNumber << ":" << columnNumber
+                << "\n";
+    }
   };
   // One can explicitly set the debug location of an expression to
   // nullopt to stop the propagation of debug locations.
@@ -2186,6 +2278,27 @@ public:
     delimiterLocations;
   BinaryLocations::FunctionLocations funcLocation;
 
+  // Code annotations for VMs. As with debug info, we do not store these on
+  // Expressions as we assume most instances are unannotated, and do not want to
+  // add constant memory overhead.
+  struct CodeAnnotation {
+    // Branch Hinting proposal: Whether the branch is likely, or unlikely.
+    std::optional<bool> branchLikely;
+
+    // Compilation Hints proposal.
+    static const uint8_t NeverInline = 0;
+    static const uint8_t AlwaysInline = 127;
+    std::optional<uint8_t> inline_;
+
+    bool operator==(const CodeAnnotation& other) const {
+      return branchLikely == other.branchLikely && inline_ == other.inline_;
+    }
+  };
+
+  // Function-level annotations are implemented with a key of nullptr, matching
+  // the 0 byte offset in the spec.
+  std::unordered_map<Expression*, CodeAnnotation> codeAnnotations;
+
   // The effects for this function, if they have been computed. We use a shared
   // ptr here to avoid compilation errors with the forward-declared
   // EffectAnalyzer.
@@ -2193,17 +2306,21 @@ public:
   // See addsEffects() in pass.h for more details.
   std::shared_ptr<EffectAnalyzer> effects;
 
-  // Inlining metadata: whether to disallow full and/or partial inlining (for
-  // details on what those mean, see Inlining.cpp).
+  // Inlining metadata: whether to disallow full and/or partial inlining. This
+  // is a toolchain-level hint. For more details, see Inlining.cpp.
   bool noFullInline = false;
   bool noPartialInline = false;
 
   // Methods
-  Signature getSig() { return type.getSignature(); }
+  Signature getSig() { return type.getHeapType().getSignature(); }
   Type getParams() { return getSig().params; }
   Type getResults() { return getSig().results; }
-  void setParams(Type params) { type = Signature(params, getResults()); }
-  void setResults(Type results) { type = Signature(getParams(), results); }
+  void setParams(Type params) {
+    type = type.with(Signature(params, getResults()));
+  }
+  void setResults(Type results) {
+    type = type.with(Signature(getParams(), results));
+  }
 
   size_t getNumParams();
   size_t getNumVars();
@@ -2228,15 +2345,20 @@ public:
   void clearDebugInfo();
 };
 
-// The kind of an import or export.
-enum class ExternalKind {
+// The kind of an import or export. Use a namespace to avoid polluting the wasm
+// namespace while maintaining implicit conversion to int, which an enum class
+// would not have.
+namespace ExternalKindImpl {
+enum Kind : uint32_t {
   Function = 0,
   Table = 1,
   Memory = 2,
   Global = 3,
   Tag = 4,
-  Invalid = -1
+  Invalid = uint32_t(-1)
 };
+} // namespace ExternalKindImpl
+using ExternalKind = ExternalKindImpl::Kind;
 
 // The kind of a top-level module item. (This overlaps with ExternalKind, but
 // C++ has no good way to extend an enum.) All such items are referred to by
@@ -2270,6 +2392,10 @@ public:
     assert(std::get_if<Name>(&value));
   }
   Name* getInternalName() { return std::get_if<Name>(&value); }
+  void setInternalName(Name name) {
+    assert(std::holds_alternative<Name>(value));
+    value = name;
+  }
 };
 
 class ElementSegment : public Named {
@@ -2401,9 +2527,15 @@ public:
   // Optional user section IR representation.
   std::unique_ptr<DylinkSection> dylinkSection;
 
-  // Source maps debug info.
+  // Source maps debug info. All of these fields are read directly in from the
+  // source map and are encoded as in the original JSON (UTF-8 encoded with
+  // with escaped quotes and slashes). The string values are uninterpreted in
+  // Binaryen, and they are written directly back out without re-encoding.
   std::vector<std::string> debugInfoFileNames;
   std::vector<std::string> debugInfoSymbolNames;
+  std::string debugInfoSourceRoot;
+  std::string debugInfoFile;
+  std::vector<std::string> debugInfoSourcesContent;
 
   // `features` are the features allowed to be used in this module and should be
   // respected regardless of the value of`hasFeaturesSection`.
@@ -2415,8 +2547,8 @@ public:
   // Module name, if specified. Serves a documentary role only.
   Name name;
 
-  std::unordered_map<HeapTypeDef, TypeNames> typeNames;
-  std::unordered_map<HeapTypeDef, Index> typeIndices;
+  std::unordered_map<HeapType, TypeNames> typeNames;
+  std::unordered_map<HeapType, Index> typeIndices;
 
   MixedArena allocator;
 
@@ -2505,8 +2637,9 @@ public:
 // Utility for printing an expression with named types.
 using ModuleExpression = std::pair<Module&, Expression*>;
 
-// Utility for printing an type with a name, if the module defines a name.
+// Utilities for printing an type with a name, if the module defines a name.
 using ModuleType = std::pair<Module&, Type>;
+using ModuleHeapType = std::pair<Module&, HeapType>;
 
 // Utility for printing only the top level of an expression. Named types will be
 // used if `module` is non-null.
@@ -2530,6 +2663,7 @@ std::ostream& operator<<(std::ostream& o, wasm::Expression& expression);
 std::ostream& operator<<(std::ostream& o, wasm::ModuleExpression pair);
 std::ostream& operator<<(std::ostream& o, wasm::ShallowExpression expression);
 std::ostream& operator<<(std::ostream& o, wasm::ModuleType pair);
+std::ostream& operator<<(std::ostream& o, wasm::ModuleHeapType pair);
 
 } // namespace std
 

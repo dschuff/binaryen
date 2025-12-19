@@ -28,6 +28,7 @@
 #include <ir/literal-utils.h>
 #include <ir/manipulation.h>
 #include <ir/names.h>
+#include <ir/public-type-validator.h>
 #include <ir/utils.h>
 #include <support/file.h>
 #include <tools/optimization-options.h>
@@ -131,6 +132,7 @@ public:
   void setPreserveImportsAndExports(bool preserveImportsAndExports_) {
     preserveImportsAndExports = preserveImportsAndExports_;
   }
+  void setImportedModule(std::string importedModuleName);
 
   void build();
 
@@ -156,6 +158,9 @@ private:
   // existing testcase (using initial-content).
   bool preserveImportsAndExports = false;
 
+  // An optional module to import from.
+  std::optional<Module> importedModule;
+
   // Whether we allow the fuzzer to add unreachable code when generating changes
   // to existing code. This is randomized during startup, but could be an option
   // like the above options eventually if we find that useful.
@@ -174,6 +179,7 @@ private:
   Name exnrefTableName;
 
   std::unordered_map<Type, Name> logImportNames;
+  Name hashMemoryName;
   Name throwImportName;
   Name tableGetImportName;
   Name tableSetImportName;
@@ -191,12 +197,11 @@ private:
   std::vector<Type> loggableTypes;
 
   // The heap types we can pick from to generate instructions.
-  std::vector<HeapTypeDef> interestingHeapTypes;
+  std::vector<HeapType> interestingHeapTypes;
 
   // A mapping of a heap type to the subset of interestingHeapTypes that are
   // subtypes of it.
-  std::unordered_map<HeapTypeDef, std::vector<HeapTypeDef>>
-    interestingHeapSubTypes;
+  std::unordered_map<HeapType, std::vector<HeapType>> interestingHeapSubTypes;
 
   // Type => list of struct fields that have that type.
   std::unordered_map<Type, std::vector<StructField>> typeStructFields;
@@ -210,10 +215,16 @@ private:
   // All arrays that are mutable.
   std::vector<HeapType> mutableArrays;
 
+  // All tags that are valid as exception tags (which cannot have results).
+  std::vector<Tag*> exceptionTags;
+
   Index numAddedFunctions = 0;
 
   // The name of an empty tag.
   Name trivialTag;
+
+  // Whether we were given initial functions.
+  bool haveInitialFunctions;
 
   // RAII helper for managing the state used to create a single function.
   struct FunctionCreationContext {
@@ -341,6 +352,13 @@ private:
   Expression* makeImportSleep(Type type);
   Expression* makeMemoryHashLogging();
 
+  // We must be careful not to add exports that have invalid public types, such
+  // as those that reach exact types when custom descriptors is disabled.
+  PublicTypeValidator publicTypeValidator;
+  bool isValidPublicType(Type type) {
+    return publicTypeValidator.isValidPublicType(type);
+  }
+
   // Function operations. The main processFunctions() loop will call addFunction
   // as well as modFunction().
   void processFunctions();
@@ -350,6 +368,9 @@ private:
   void modFunction(Function* func);
 
   void addHangLimitChecks(Function* func);
+
+  void useImportedFunctions();
+  void useImportedGlobals();
 
   // Recombination and mutation
 
@@ -361,6 +382,10 @@ private:
   // instruction for EH is supposed to exist only at the beginning of a 'catch'
   // block, so it shouldn't be moved around or deleted freely.
   bool canBeArbitrarilyReplaced(Expression* curr) {
+    // TODO: Remove this once we better support exact references.
+    if (curr->type.isExact()) {
+      return false;
+    }
     return curr->type.isDefaultable() &&
            !EHUtils::containsValidDanglingPop(curr);
   }
@@ -369,6 +394,9 @@ private:
   // Fix up the IR after recombination and mutation.
   void fixAfterChanges(Function* func);
   void modifyInitialFunctions();
+
+  // Note a global for use during code generation.
+  void useGlobalLater(Global* global);
 
   // Initial wasm contents may have come from a test that uses the drop pattern:
   //
@@ -459,6 +487,7 @@ private:
   // used in a place that will trap on null. For example, the reference of a
   // struct.get or array.set would use this.
   Expression* makeTrappingRefUse(HeapType type);
+  Expression* makeTrappingRefUse(Type type);
 
   Expression* buildUnary(const UnaryArgs& args);
   Expression* makeUnary(Type type);
@@ -487,6 +516,7 @@ private:
   Expression* makeRefEq(Type type);
   Expression* makeRefTest(Type type);
   Expression* makeRefCast(Type type);
+  Expression* makeRefGetDesc(Type type);
   Expression* makeBrOn(Type type);
 
   // Decide to emit a signed Struct/ArrayGet sometimes, when the field is
@@ -513,6 +543,7 @@ private:
   // Getters for Types
   Type getSingleConcreteType();
   Type getReferenceType();
+  Type getCastableReferenceType();
   Type getEqReferenceType();
   Type getMVPType();
   Type getTupleType();
@@ -522,13 +553,14 @@ private:
   Type getLoggableType();
   bool isLoggableType(Type type);
   Nullability getNullability();
+  Exactness getExactness();
   Nullability getSubType(Nullability nullability);
+  Exactness getSubType(Exactness exactness);
   HeapType getSubType(HeapType type);
   Type getSubType(Type type);
   Nullability getSuperType(Nullability nullability);
   HeapType getSuperType(HeapType type);
   Type getSuperType(Type type);
-  HeapType getArrayTypeForString();
 
   // Utilities
   Name getTargetName(Expression* target);

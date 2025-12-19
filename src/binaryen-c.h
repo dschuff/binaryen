@@ -1016,8 +1016,13 @@ BinaryenCallRef(BinaryenModuleRef module,
                 BinaryenExpressionRef target,
                 BinaryenExpressionRef* operands,
                 BinaryenIndex numOperands,
-                BinaryenType type,
-                bool isReturn);
+                BinaryenType type);
+BINARYEN_API BinaryenExpressionRef
+BinaryenReturnCallRef(BinaryenModuleRef module,
+                      BinaryenExpressionRef target,
+                      BinaryenExpressionRef* operands,
+                      BinaryenIndex numOperands,
+                      BinaryenType type);
 BINARYEN_API BinaryenExpressionRef BinaryenRefTest(BinaryenModuleRef module,
                                                    BinaryenExpressionRef ref,
                                                    BinaryenType castType);
@@ -1050,11 +1055,16 @@ BINARYEN_API BinaryenExpressionRef BinaryenArrayNew(BinaryenModuleRef module,
                                                     BinaryenHeapType type,
                                                     BinaryenExpressionRef size,
                                                     BinaryenExpressionRef init);
-
 BINARYEN_API BinaryenExpressionRef
 BinaryenArrayNewData(BinaryenModuleRef module,
                      BinaryenHeapType type,
                      const char* name,
+                     BinaryenExpressionRef offset,
+                     BinaryenExpressionRef size);
+BINARYEN_API BinaryenExpressionRef
+BinaryenArrayNewElem(BinaryenModuleRef module,
+                     BinaryenHeapType type,
+                     const char* seg,
                      BinaryenExpressionRef offset,
                      BinaryenExpressionRef size);
 BINARYEN_API BinaryenExpressionRef
@@ -1082,11 +1092,31 @@ BinaryenArrayCopy(BinaryenModuleRef module,
                   BinaryenExpressionRef srcIndex,
                   BinaryenExpressionRef length);
 BINARYEN_API BinaryenExpressionRef
+BinaryenArrayFill(BinaryenModuleRef module,
+                  BinaryenExpressionRef ref,
+                  BinaryenExpressionRef index,
+                  BinaryenExpressionRef value,
+                  BinaryenExpressionRef size);
+BINARYEN_API BinaryenExpressionRef
 BinaryenStringNew(BinaryenModuleRef module,
                   BinaryenOp op,
                   BinaryenExpressionRef ref,
                   BinaryenExpressionRef start,
                   BinaryenExpressionRef end);
+BINARYEN_API BinaryenExpressionRef
+BinaryenArrayInitData(BinaryenModuleRef module,
+                      const char* name,
+                      BinaryenExpressionRef ref,
+                      BinaryenExpressionRef index,
+                      BinaryenExpressionRef offset,
+                      BinaryenExpressionRef size);
+BINARYEN_API BinaryenExpressionRef
+BinaryenArrayInitElem(BinaryenModuleRef module,
+                      const char* seg,
+                      BinaryenExpressionRef ref,
+                      BinaryenExpressionRef index,
+                      BinaryenExpressionRef offset,
+                      BinaryenExpressionRef size);
 BINARYEN_API BinaryenExpressionRef BinaryenStringConst(BinaryenModuleRef module,
                                                        const char* name);
 BINARYEN_API BinaryenExpressionRef BinaryenStringMeasure(
@@ -2444,6 +2474,36 @@ BinaryenArrayNewFixedInsertValueAt(BinaryenExpressionRef expr,
 BINARYEN_API BinaryenExpressionRef BinaryenArrayNewFixedRemoveValueAt(
   BinaryenExpressionRef expr, BinaryenIndex index);
 
+// ArrayNewData
+
+BINARYEN_API const char*
+BinaryenArrayNewDataGetSegment(BinaryenExpressionRef expr);
+BINARYEN_API void BinaryenArrayNewDataSetSegment(BinaryenExpressionRef expr,
+                                                 const char* segment);
+BINARYEN_API BinaryenExpressionRef
+BinaryenArrayNewDataGetOffset(BinaryenExpressionRef expr);
+BINARYEN_API void BinaryenArrayNewDataSetOffset(BinaryenExpressionRef expr,
+                                                BinaryenExpressionRef offset);
+BINARYEN_API BinaryenExpressionRef
+BinaryenArrayNewDataGetSize(BinaryenExpressionRef expr);
+BINARYEN_API void BinaryenArrayNewDataSetSize(BinaryenExpressionRef expr,
+                                              BinaryenExpressionRef size);
+
+// ArrayNewElem
+
+BINARYEN_API const char*
+BinaryenArrayNewElemGetSegment(BinaryenExpressionRef expr);
+BINARYEN_API void BinaryenArrayNewElemSetSegment(BinaryenExpressionRef expr,
+                                                 const char* segment);
+BINARYEN_API BinaryenExpressionRef
+BinaryenArrayNewElemGetOffset(BinaryenExpressionRef expr);
+BINARYEN_API void BinaryenArrayNewElemSetOffset(BinaryenExpressionRef expr,
+                                                BinaryenExpressionRef offset);
+BINARYEN_API BinaryenExpressionRef
+BinaryenArrayNewElemGetSize(BinaryenExpressionRef expr);
+BINARYEN_API void BinaryenArrayNewElemSetSize(BinaryenExpressionRef expr,
+                                              BinaryenExpressionRef size);
+
 // ArrayGet
 
 BINARYEN_API BinaryenExpressionRef
@@ -2480,6 +2540,25 @@ BinaryenArrayLenGetRef(BinaryenExpressionRef expr);
 BINARYEN_API void BinaryenArrayLenSetRef(BinaryenExpressionRef expr,
                                          BinaryenExpressionRef refExpr);
 
+// ArrayFill
+
+BINARYEN_API BinaryenExpressionRef
+BinaryenArrayFillGetRef(BinaryenExpressionRef expr);
+BINARYEN_API void BinaryenArrayFillSetRef(BinaryenExpressionRef expr,
+                                          BinaryenExpressionRef refExpr);
+BINARYEN_API BinaryenExpressionRef
+BinaryenArrayFillGetIndex(BinaryenExpressionRef expr);
+BINARYEN_API void BinaryenArrayFillSetIndex(BinaryenExpressionRef expr,
+                                            BinaryenExpressionRef indexExpr);
+BINARYEN_API BinaryenExpressionRef
+BinaryenArrayFillGetValue(BinaryenExpressionRef expr);
+BINARYEN_API void BinaryenArrayFillSetValue(BinaryenExpressionRef expr,
+                                            BinaryenExpressionRef valueExpr);
+BINARYEN_API BinaryenExpressionRef
+BinaryenArrayFillGetSize(BinaryenExpressionRef expr);
+BINARYEN_API void BinaryenArrayFillSetSize(BinaryenExpressionRef expr,
+                                           BinaryenExpressionRef sizeExpr);
+
 // ArrayCopy
 
 BINARYEN_API BinaryenExpressionRef
@@ -2506,6 +2585,52 @@ BinaryenArrayCopyGetLength(BinaryenExpressionRef expr);
 BINARYEN_API void BinaryenArrayCopySetLength(BinaryenExpressionRef expr,
                                              BinaryenExpressionRef lengthExpr);
 
+// ArrayInitData
+
+BINARYEN_API const char*
+BinaryenArrayInitDataGetSegment(BinaryenExpressionRef expr);
+BINARYEN_API void BinaryenArrayInitDataSetSegment(BinaryenExpressionRef expr,
+                                                  const char* segment);
+BINARYEN_API BinaryenExpressionRef
+BinaryenArrayInitDataGetRef(BinaryenExpressionRef expr);
+BINARYEN_API void BinaryenArrayInitDataSetRef(BinaryenExpressionRef expr,
+                                              BinaryenExpressionRef ref);
+BINARYEN_API BinaryenExpressionRef
+BinaryenArrayInitDataGetIndex(BinaryenExpressionRef expr);
+BINARYEN_API void BinaryenArrayInitDataSetIndex(BinaryenExpressionRef expr,
+                                                BinaryenExpressionRef index);
+BINARYEN_API BinaryenExpressionRef
+BinaryenArrayInitDataGetOffset(BinaryenExpressionRef expr);
+BINARYEN_API void BinaryenArrayInitDataSetOffset(BinaryenExpressionRef expr,
+                                                 BinaryenExpressionRef offset);
+BINARYEN_API BinaryenExpressionRef
+BinaryenArrayInitDataGetSize(BinaryenExpressionRef expr);
+BINARYEN_API void BinaryenArrayInitDataSetSize(BinaryenExpressionRef expr,
+                                               BinaryenExpressionRef size);
+
+// ArrayInitElem
+
+BINARYEN_API const char*
+BinaryenArrayInitElemGetSegment(BinaryenExpressionRef expr);
+BINARYEN_API void BinaryenArrayInitElemSetSegment(BinaryenExpressionRef expr,
+                                                  const char* segment);
+BINARYEN_API BinaryenExpressionRef
+BinaryenArrayInitElemGetRef(BinaryenExpressionRef expr);
+BINARYEN_API void BinaryenArrayInitElemSetRef(BinaryenExpressionRef expr,
+                                              BinaryenExpressionRef ref);
+BINARYEN_API BinaryenExpressionRef
+BinaryenArrayInitElemGetIndex(BinaryenExpressionRef expr);
+BINARYEN_API void BinaryenArrayInitElemSetIndex(BinaryenExpressionRef expr,
+                                                BinaryenExpressionRef index);
+BINARYEN_API BinaryenExpressionRef
+BinaryenArrayInitElemGetOffset(BinaryenExpressionRef expr);
+BINARYEN_API void BinaryenArrayInitElemSetOffset(BinaryenExpressionRef expr,
+                                                 BinaryenExpressionRef offset);
+BINARYEN_API BinaryenExpressionRef
+BinaryenArrayInitElemGetSize(BinaryenExpressionRef expr);
+BINARYEN_API void BinaryenArrayInitElemSetSize(BinaryenExpressionRef expr,
+                                               BinaryenExpressionRef size);
+
 // StringNew
 
 BINARYEN_API BinaryenOp BinaryenStringNewGetOp(BinaryenExpressionRef expr);
@@ -2523,8 +2648,6 @@ BINARYEN_API BinaryenExpressionRef
 BinaryenStringNewGetEnd(BinaryenExpressionRef expr);
 BINARYEN_API void BinaryenStringNewSetEnd(BinaryenExpressionRef expr,
                                           BinaryenExpressionRef endExpr);
-BINARYEN_API void BinaryenStringNewSetTry(BinaryenExpressionRef expr,
-                                          bool try_);
 
 // StringConst
 
@@ -3029,6 +3152,14 @@ BINARYEN_API BinaryenIndex BinaryenGetFlexibleInlineMaxSize(void);
 // Sets the function size which we inline when functions are lightweight.
 // Applies to all modules, globally.
 BINARYEN_API void BinaryenSetFlexibleInlineMaxSize(BinaryenIndex size);
+
+// Gets the limit for the combined size of the code after inlining.
+// Applies to all modules, globally.
+BINARYEN_API BinaryenIndex BinaryenGetMaxCombinedBinarySize(void);
+
+// Sets the limit for the combined size of the code after inlining.
+// Applies to all modules, globally.
+BINARYEN_API void BinaryenSetMaxCombinedBinarySize(BinaryenIndex size);
 
 // Gets the function size which we inline when there is only one caller.
 // Applies to all modules, globally.

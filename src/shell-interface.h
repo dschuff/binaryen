@@ -102,13 +102,21 @@ struct ShellExternalInterface : ModuleRunner::ExternalInterface {
   }
   virtual ~ShellExternalInterface() = default;
 
-  ModuleRunner* getImportInstance(Importable* import) {
+  ModuleRunner* getImportInstanceOrNull(Importable* import) {
     auto it = linkedInstances.find(import->module);
     if (it == linkedInstances.end()) {
-      Fatal() << "importGlobals: unknown import: " << import->module.str << "."
-              << import->base.str;
+      return nullptr;
     }
     return it->second.get();
+  }
+
+  ModuleRunner* getImportInstance(Importable* import) {
+    auto* ret = getImportInstanceOrNull(import);
+    if (!ret) {
+      Fatal() << "getImportInstance: unknown import: " << import->module.str
+              << "." << import->base.str;
+    }
+    return ret;
   }
 
   void init(Module& wasm, ModuleRunner& instance) override {
@@ -133,66 +141,43 @@ struct ShellExternalInterface : ModuleRunner::ExternalInterface {
     });
   }
 
-  Literals callImport(Function* import, const Literals& arguments) override {
+  Literal getImportedFunction(Function* import) override {
+    // TODO: We should perhaps restrict the types with which the well-known
+    // functions can be imported.
     if (import->module == SPECTEST && import->base.startsWith(PRINT)) {
-      for (auto argument : arguments) {
-        std::cout << argument << " : " << argument.type << '\n';
-      }
-      return {};
+      // Use a null instance because these are host functions.
+      return Literal(
+        std::make_shared<FuncData>(import->name,
+                                   nullptr,
+                                   [](const Literals& arguments) -> Flow {
+                                     for (auto argument : arguments) {
+                                       std::cout << argument << " : "
+                                                 << argument.type << '\n';
+                                     }
+                                     return Flow();
+                                   }),
+        import->type);
     } else if (import->module == ENV && import->base == EXIT) {
-      // XXX hack for torture tests
-      std::cout << "exit()\n";
-      throw ExitException();
-    } else if (auto* inst = getImportInstance(import)) {
-      return inst->callExport(import->base, arguments);
+      return Literal(std::make_shared<FuncData>(import->name,
+                                                nullptr,
+                                                [](const Literals&) -> Flow {
+                                                  // XXX hack for torture tests
+                                                  std::cout << "exit()\n";
+                                                  throw ExitException();
+                                                }),
+                     import->type);
+    } else if (auto* inst = getImportInstanceOrNull(import)) {
+      return inst->getExportedFunction(import->base);
     }
-    Fatal() << "callImport: unknown import: " << import->module.str << "."
-            << import->name.str;
+    // This is not a known import. Create a literal for it, which is good enough
+    // if it is never called (see the ref_func.wast spec test, which does that).
+    std::cerr << "warning: getImportedFunction: unknown import: "
+              << import->module.str << "." << import->name.str << '\n';
+    return Literal::makeFunc(import->name, import->type);
   }
 
-  Literals callTable(Name tableName,
-                     Address index,
-                     HeapType sig,
-                     Literals& arguments,
-                     Type results,
-                     ModuleRunner& instance) override {
-
-    auto it = tables.find(tableName);
-    if (it == tables.end()) {
-      trap("callTable on non-existing table");
-    }
-
-    auto& table = it->second;
-    if (index >= table.size()) {
-      trap("callTable overflow");
-    }
-    Function* func = nullptr;
-    if (table[index].isFunction() && !table[index].isNull()) {
-      func = instance.wasm.getFunctionOrNull(table[index].getFunc());
-    }
-    if (!func) {
-      trap("uninitialized table element");
-    }
-    if (sig != func->type) {
-      trap("callIndirect: function types don't match");
-    }
-    if (func->getParams().size() != arguments.size()) {
-      trap("callIndirect: bad # of arguments");
-    }
-    size_t i = 0;
-    for (const auto& param : func->getParams()) {
-      if (!Type::isSubType(arguments[i++].type, param)) {
-        trap("callIndirect: bad argument type");
-      }
-    }
-    if (func->getResults() != results) {
-      trap("callIndirect: bad result type");
-    }
-    if (func->imported()) {
-      return callImport(func, arguments);
-    } else {
-      return instance.callFunction(func->name, arguments);
-    }
+  Tag* getImportedTag(Tag* tag) override {
+    WASM_UNREACHABLE("missing imported tag");
   }
 
   int8_t load8s(Address addr, Name memoryName) override {

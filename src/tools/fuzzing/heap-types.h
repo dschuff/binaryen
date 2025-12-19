@@ -32,8 +32,8 @@ struct HeapTypeGenerator {
   // The intended subtypes of each built type.
   std::vector<std::vector<Index>> subtypeIndices;
 
-  // The intended supertype of each built type, if any.
-  std::vector<std::optional<Index>> supertypeIndices;
+  // The intended descriptor of each built type.
+  std::vector<std::optional<Index>> descriptorIndices;
 
   // Create a populated `HeapTypeGenerator` with `n` random HeapTypes with
   // interesting subtyping.
@@ -42,12 +42,12 @@ struct HeapTypeGenerator {
   // Given a sequence of newly-built heap types, produce a sequence of similar
   // or identical types that are all inhabitable, i.e. that are possible to
   // create values for.
-  static std::vector<HeapTypeDef>
-  makeInhabitable(const std::vector<HeapTypeDef>& types);
+  static std::vector<HeapType>
+  makeInhabitable(const std::vector<HeapType>& types);
 
   // Returns the types in the input that are inhabitable.
-  static std::vector<HeapTypeDef>
-  getInhabitable(const std::vector<HeapTypeDef>& types);
+  static std::vector<HeapType>
+  getInhabitable(const std::vector<HeapType>& types);
 };
 
 } // namespace wasm

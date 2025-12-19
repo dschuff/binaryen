@@ -30,16 +30,18 @@
 
 #include <atomic>
 
+#include "ir/branch-hints.h"
 #include "ir/branch-utils.h"
-#include "ir/debuginfo.h"
 #include "ir/drop.h"
 #include "ir/eh-utils.h"
 #include "ir/element-utils.h"
 #include "ir/find_all.h"
 #include "ir/literal-utils.h"
 #include "ir/localize.h"
+#include "ir/metadata.h"
 #include "ir/module-utils.h"
 #include "ir/names.h"
+#include "ir/properties.h"
 #include "ir/type-updating.h"
 #include "ir/utils.h"
 #include "parsing.h"
@@ -67,7 +69,35 @@ enum class InliningMode {
   SplitPatternB
 };
 
-// Useful into on a function, helping us decide if we can inline it
+// Whether a function is just one instruction that always shrinks when inlined.
+enum class TrivialInstruction {
+  // Function is not a single instruction, or it may not shrink when inlined.
+  NotTrivial,
+
+  // Function is just one instruction, with `local.get`s as arguments, and with
+  // each `local` is used exactly once, and in the order they appear in the
+  // argument list.
+  //
+  // In this case, inlining the function generates smaller code, and it is also
+  // good for runtime. (Note that in theory inlining an instruction might grow
+  // the size, if before we had a call - one byte+LEB - and after we have
+  // something like a prefixed instruction - two bytes - with some other LEB
+  // like a type index. Figuring out when the LEBs will cause growth here is
+  // hard, and probably not worth it, since doing a call to run a single
+  // instruction is almost always going to be larger and slower.)
+  Shrinks,
+
+  // Function is a single instruction, but maybe with constant arguments, or
+  // maybe some locals are used more than once. In these cases code size does
+  // not always shrink: at the call sites, omitted locals can create `drop`
+  // instructions, a local used multiple times can create new locals, and
+  // encoding of constants may be larger than just a `local.get` with a small
+  // index. In these cases we still want to inline with `-O3`, but the code size
+  // may increase when inlined.
+  MayNotShrink,
+};
+
+// Useful info on a function, helping us decide if we can inline it.
 struct FunctionInfo {
   std::atomic<Index> refs;
   Index size;
@@ -77,16 +107,7 @@ struct FunctionInfo {
   // Something is used globally if there is a reference to it in a table or
   // export etc.
   bool usedGlobally;
-  // We consider a function to be a trivial call if the body is just a call with
-  // trivial arguments, like this:
-  //
-  //  (func $forward (param $x) (param $y)
-  //    (call $target (local.get $x) (local.get $y))
-  //  )
-  //
-  // Specifically the body must be a call, and the operands to the call must be
-  // of size 1 (generally, LocalGet or Const).
-  bool isTrivialCall;
+  TrivialInstruction trivialInstruction;
   InliningMode inliningMode;
 
   FunctionInfo() { clear(); }
@@ -98,7 +119,7 @@ struct FunctionInfo {
     hasLoops = false;
     hasTryDelegate = false;
     usedGlobally = false;
-    isTrivialCall = false;
+    trivialInstruction = TrivialInstruction::NotTrivial;
     inliningMode = InliningMode::Unknown;
   }
 
@@ -110,7 +131,7 @@ struct FunctionInfo {
     hasLoops = other.hasLoops;
     hasTryDelegate = other.hasTryDelegate;
     usedGlobally = other.usedGlobally;
-    isTrivialCall = other.isTrivialCall;
+    trivialInstruction = other.trivialInstruction;
     inliningMode = other.inliningMode;
     return *this;
   }
@@ -132,6 +153,11 @@ struct FunctionInfo {
         size <= options.inlining.oneCallerInlineMaxSize) {
       return true;
     }
+    // If the function calls another one in a way that always shrinks when
+    // inlined, inline it in all optimization and shrink modes.
+    if (trivialInstruction == TrivialInstruction::Shrinks) {
+      return true;
+    }
     // If it's so big that we have no flexible options that could allow it,
     // do not inline.
     if (size > options.inlining.flexibleInlineMaxSize) {
@@ -143,22 +169,15 @@ struct FunctionInfo {
     if (options.shrinkLevel > 0 || options.optimizeLevel < 3) {
       return false;
     }
-    if (hasCalls) {
-      // This has calls. If it is just a trivial call itself then inline, as we
-      // will save a call that way - basically we skip a trampoline in the
-      // middle - but if it is something more complex, leave it alone, as we may
-      // not help much (and with recursion we may end up with a wasteful
-      // increase in code size).
-      //
-      // Note that inlining trivial calls may increase code size, e.g. if they
-      // use a parameter more than once (forcing us after inlining to save that
-      // value to a local, etc.), but here we are optimizing for speed and not
-      // size, so we risk it.
-      return isTrivialCall;
+    // The function is just one instruction, but the code size may increase when
+    // inlined. We only inline it fully with `-O3`.
+    if (trivialInstruction == TrivialInstruction::MayNotShrink) {
+      return true;
     }
-    // This doesn't have calls. Inline if loops do not prevent us (normally, a
-    // loop suggests a lot of work and so inlining is less useful).
-    return !hasLoops || options.inlining.allowFunctionsWithLoops;
+    // Trivial instructions are already handled. Inline if
+    // 1. The function doesn't have calls, and
+    // 2. The function doesn't have loops, or we allow inlining with loops.
+    return !hasCalls && (!hasLoops || options.inlining.allowFunctionsWithLoops);
   }
 };
 
@@ -178,6 +197,8 @@ using NameInfoMap = std::unordered_map<Name, FunctionInfo>;
 struct FunctionInfoScanner
   : public WalkerPass<PostWalker<FunctionInfoScanner>> {
   bool isFunctionParallel() override { return true; }
+
+  bool modifiesBinaryenIR() override { return false; }
 
   FunctionInfoScanner(NameInfoMap& infos) : infos(infos) {}
 
@@ -226,11 +247,47 @@ struct FunctionInfoScanner
 
     info.size = Measurer::measure(curr->body);
 
-    if (auto* call = curr->body->dynCast<Call>()) {
-      if (info.size == call->operands.size() + 1) {
-        // This function body is a call with some trivial (size 1) operands like
-        // LocalGet or Const, so it is a trivial call.
-        info.isTrivialCall = true;
+    // If the body is a simple instruction with roughly the same encoded size as
+    // a `call` instruction, and arguments are function locals read in order,
+    // then the code size always shrinks when the call is inlined.
+    //
+    // Note that skipping arguments can create `drop` instructions, and using
+    // arguments multiple times can create new locals, at the call sites. So we
+    // don't consider the function as "always shrinks" in these cases.
+    // TODO: Consider allowing drops, as at least in traps-never-happen mode
+    //       they can usually be removed.
+    auto* body = curr->body;
+    // Skip control flow as those can be substantially larger (middle and end
+    // bytes in an If), or no situation exists where we can optimize them (a
+    // Block with only LocalGets would have been removed by other passes).
+    if (!Properties::isControlFlowStructure(body)) {
+      bool shrinks = true;
+      Index nextLocalGetIndex = 0;
+      for (auto* operand : ChildIterator(body)) {
+        if (auto* localGet = operand->dynCast<LocalGet>()) {
+          if (localGet->index == nextLocalGetIndex) {
+            nextLocalGetIndex++;
+          } else {
+            shrinks = false;
+            break;
+          }
+        } else {
+          shrinks = false;
+          break;
+        }
+      }
+
+      if (shrinks) {
+        info.trivialInstruction = TrivialInstruction::Shrinks;
+        return;
+      }
+
+      // If the operands are trivial (size 1) like LocalGet or Const, we still
+      // consider this as trivial instruction, but the size may not shrink when
+      // inlined.
+      uint32_t numOperands = ChildIterator(body).children.size();
+      if (info.size == numOperands + 1) {
+        info.trivialInstruction = TrivialInstruction::MayNotShrink;
       }
     }
   }
@@ -267,6 +324,8 @@ struct InliningState {
 
 struct Planner : public WalkerPass<TryDepthWalker<Planner>> {
   bool isFunctionParallel() override { return true; }
+
+  bool modifiesBinaryenIR() override { return false; }
 
   Planner(InliningState* state) : state(state) {}
 
@@ -580,7 +639,7 @@ static void doCodeInlining(Module* module,
 
   // Generate and update the inlined contents
   auto* contents = ExpressionManipulator::copy(from->body, *module);
-  debuginfo::copyBetweenFunctions(from->body, contents, from, into);
+  metadata::copyBetweenFunctions(from->body, contents, from, into);
   updater.walk(contents);
   block->list.push_back(contents);
   block->type = retType;
@@ -633,8 +692,9 @@ static void updateAfterInlining(Module* module, Function* into) {
   // Inlining unreachable contents can make things in the function we inlined
   // into unreachable.
   ReFinalize().walkFunctionInModule(into, module);
-  // New locals we added may require fixups for nondefaultability.
-  // FIXME Is this not done automatically?
+  // New locals we added may require fixups for nondefaultability. We do this
+  // here and not in the main pass (or its subpasses) so that we only do it
+  // where needed.
   TypeUpdating::handleNonDefaultableLocals(into, *module);
 }
 
@@ -654,6 +714,9 @@ using ChosenActions = std::unordered_map<Name, std::vector<InliningAction>>;
 // perform.
 struct DoInlining : public Pass {
   bool isFunctionParallel() override { return true; }
+
+  // We do this only where we inline, inside updateAfterInlining().
+  bool requiresNonNullableLocalFixups() override { return false; }
 
   std::unique_ptr<Pass> create() override {
     return std::make_unique<DoInlining>(chosenActions);
@@ -923,7 +986,19 @@ struct FunctionSplitter {
     if (finalItem && getItem(body, numIfs + 1)) {
       return InliningMode::Uninlineable;
     }
-    // This has the general shape we seek. Check each if.
+    // This has the general shape we seek. Check each if: it must be in the
+    // form mentioned above (simple condition, no returns in body). We must also
+    // have no sets of locals that the final item notices, as then we could
+    // have this:
+    //
+    //  if (A) {
+    //    x = 10;
+    //  }
+    //  return x;
+    //
+    // We cannot split out the if in such a case because of the local
+    // dependency.
+    std::unordered_set<Index> writtenLocals;
     for (Index i = 0; i < numIfs; i++) {
       auto* iff = getIf(body, i);
       // The if must have a simple condition and no else arm.
@@ -940,7 +1015,21 @@ struct FunctionSplitter {
         // unreachable, and we ruled out none before.
         assert(iff->ifTrue->type == Type::unreachable);
       }
+      if (finalItem) {
+        for (auto* set : FindAll<LocalSet>(iff).list) {
+          writtenLocals.insert(set->index);
+        }
+      }
     }
+    // Finish the locals check mentioned above.
+    if (finalItem) {
+      for (auto* get : FindAll<LocalGet>(finalItem).list) {
+        if (writtenLocals.count(get->index)) {
+          return InliningMode::Uninlineable;
+        }
+      }
+    }
+
     // Success, this matches the pattern.
 
     // If the outlined function will be worth inlining normally, skip the
@@ -1043,6 +1132,7 @@ private:
       auto* inlineableIf = getIf(inlineable->body);
       inlineableIf->condition =
         builder.makeUnary(EqZInt32, inlineableIf->condition);
+      BranchHints::flip(inlineableIf, inlineable);
       inlineableIf->ifTrue = builder.makeCall(
         outlined->name, getForwardedArgs(func, builder), Type::none);
       inlineable->body = inlineableIf;
@@ -1172,6 +1262,9 @@ struct Inlining : public Pass {
   // FIXME DWARF updating does not handle local changes yet.
   bool invalidatesDWARF() override { return true; }
 
+  // We do this only where we inline, inside updateAfterInlining().
+  bool requiresNonNullableLocalFixups() override { return false; }
+
   // whether to optimize where we inline
   bool optimize = false;
 
@@ -1262,7 +1355,7 @@ struct Inlining : public Pass {
     // fill in info, as we operate on it in parallel (each function to its own
     // entry)
     for (auto& func : module->functions) {
-      infos[func->name];
+      infos.try_emplace(func->name);
     }
     {
       FunctionInfoScanner scanner(infos);
@@ -1306,7 +1399,7 @@ struct Inlining : public Pass {
     // without iterator invalidation.
     std::vector<Name> funcNames;
     for (auto& func : module->functions) {
-      state.actionsForFunction[func->name];
+      state.actionsForFunction.try_emplace(func->name);
       funcNames.push_back(func->name);
     }
 
@@ -1445,21 +1538,13 @@ struct Inlining : public Pass {
   }
 
   // Checks if the combined size of the code after inlining is under the
-  // absolute size limit. We have an absolute limit in order to avoid
-  // extremely-large sizes after inlining, as they may hit limits in VMs and/or
-  // slow down startup (measurements there indicate something like ~1 second to
-  // optimize a 100K function). See e.g.
-  // https://github.com/WebAssembly/binaryen/pull/3730#issuecomment-867939138
-  // https://github.com/emscripten-core/emscripten/issues/13899#issuecomment-825073344
+  // absolute size limit.
   bool isUnderSizeLimit(Name target, Name source) {
     // Estimate the combined binary size from the number of instructions.
     auto combinedSize = infos[target].size + infos[source].size;
     auto estimatedBinarySize = Measurer::BytesPerExpr * combinedSize;
-    // The limit is arbitrary, but based on the links above. It is a very high
-    // value that should appear very rarely in practice (for example, it does
-    // not occur on the Emscripten benchmark suite of real-world codebases).
-    const Index MaxCombinedBinarySize = 400 * 1024;
-    return estimatedBinarySize < MaxCombinedBinarySize;
+    auto& options = getPassRunner()->options;
+    return estimatedBinarySize < options.inlining.maxCombinedBinarySize;
   }
 };
 

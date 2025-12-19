@@ -47,6 +47,12 @@ struct CostAnalyzer : public OverriddenVisitor<CostAnalyzer, CostType> {
   // cost due to shortening the time to the next collection.
   static const CostType AllocationCost = 100;
 
+  // Calls can have unpredictable, unknown cost. Model it as a large number.
+  // TODO: For calls to functions in this module, we could in principle scan
+  //       them. However, call effects generally mean the cost is a moot point,
+  //       except for call.without.effects, which is rare.
+  static const CostType CallCost = 100;
+
   CostType maybeVisit(Expression* curr) { return curr ? visit(curr) : 0; }
 
   CostType visitBlock(Block* curr) {
@@ -68,23 +74,23 @@ struct CostAnalyzer : public OverriddenVisitor<CostAnalyzer, CostType> {
     return 2 + visit(curr->condition) + maybeVisit(curr->value);
   }
   CostType visitCall(Call* curr) {
-    // XXX this does not take into account if the call is to an import, which
-    //     may be costlier in general
-    CostType ret = 4;
+    CostType ret = CallCost;
     for (auto* child : curr->operands) {
       ret += visit(child);
     }
     return ret;
   }
   CostType visitCallIndirect(CallIndirect* curr) {
-    CostType ret = 6 + visit(curr->target);
+    // Model indirect calls as more expensive than direct ones.
+    CostType ret = CallCost + 1 + visit(curr->target);
     for (auto* child : curr->operands) {
       ret += visit(child);
     }
     return ret;
   }
   CostType visitCallRef(CallRef* curr) {
-    CostType ret = 5 + visit(curr->target);
+    // Model call_refs as more expensive than direct calls.
+    CostType ret = CallCost + 1 + visit(curr->target);
     for (auto* child : curr->operands) {
       ret += visit(child);
     }
@@ -116,6 +122,11 @@ struct CostAnalyzer : public OverriddenVisitor<CostAnalyzer, CostType> {
     return AtomicCost + visit(curr->ptr) + visit(curr->notifyCount);
   }
   CostType visitAtomicFence(AtomicFence* curr) { return AtomicCost; }
+  CostType visitPause(Pause* curr) {
+    // When used properly, pause only makes things more efficient, so we do not
+    // model it as having any cost.
+    return 0;
+  }
   CostType visitConst(Const* curr) { return 1; }
   CostType visitUnary(Unary* curr) {
     CostType ret = 0;
@@ -631,6 +642,7 @@ struct CostAnalyzer : public OverriddenVisitor<CostAnalyzer, CostType> {
   CostType visitTableInit(TableInit* curr) {
     return 6 + visit(curr->dest) + visit(curr->offset) + visit(curr->size);
   }
+  CostType visitElemDrop(ElemDrop* curr) { return 6; }
   CostType visitTry(Try* curr) {
     // We assume no exception will be thrown in most cases
     return visit(curr->body);
@@ -668,17 +680,32 @@ struct CostAnalyzer : public OverriddenVisitor<CostAnalyzer, CostType> {
   CostType visitRefCast(RefCast* curr) {
     return CastCost + nullCheckCost(curr->ref) + visit(curr->ref);
   }
+  CostType visitRefGetDesc(RefGetDesc* curr) {
+    return 1 + nullCheckCost(curr->ref) + visit(curr->ref);
+  }
   CostType visitBrOn(BrOn* curr) {
     // BrOn of a null can be fairly fast, but anything else is a cast check.
-    CostType base =
-      curr->op == BrOnNull || curr->op == BrOnNonNull ? 2 : CastCost;
-    return base + nullCheckCost(curr->ref) + maybeVisit(curr->ref);
+    switch (curr->op) {
+      case BrOnNull:
+      case BrOnNonNull:
+        return 2 + nullCheckCost(curr->ref) + visit(curr->ref);
+      case BrOnCast:
+      case BrOnCastFail:
+        return CastCost + visit(curr->ref);
+      case BrOnCastDesc:
+      case BrOnCastDescFail:
+        // These are not as expensive as full casts, since they just do a
+        // identity check on the descriptor.
+        return 2 + visit(curr->ref) + visit(curr->desc);
+    }
+    WASM_UNREACHABLE("unexpected op");
   }
   CostType visitStructNew(StructNew* curr) {
     CostType ret = AllocationCost + curr->operands.size();
     for (auto* child : curr->operands) {
       ret += visit(child);
     }
+    ret += maybeVisit(curr->desc);
     return ret;
   }
   CostType visitStructGet(StructGet* curr) {
@@ -738,6 +765,15 @@ struct CostAnalyzer : public OverriddenVisitor<CostAnalyzer, CostType> {
     return 6 + visit(curr->ref) + visit(curr->index) + visit(curr->offset) +
            visit(curr->size);
   }
+  CostType visitArrayRMW(ArrayRMW* curr) {
+    return AtomicCost + nullCheckCost(curr->ref) + visit(curr->ref) +
+           visit(curr->index) + visit(curr->value);
+  }
+  CostType visitArrayCmpxchg(ArrayCmpxchg* curr) {
+    return AtomicCost + nullCheckCost(curr->ref) + visit(curr->ref) +
+           visit(curr->index) + visit(curr->expected) +
+           visit(curr->replacement);
+  }
   CostType visitRefAs(RefAs* curr) { return 1 + visit(curr->value); }
   CostType visitStringNew(StringNew* curr) {
     return 8 + visit(curr->ref) + maybeVisit(curr->start) +
@@ -762,6 +798,10 @@ struct CostAnalyzer : public OverriddenVisitor<CostAnalyzer, CostType> {
   CostType visitStringEq(StringEq* curr) {
     // "3" is chosen since strings might or might not be interned in the engine.
     return 3 + visit(curr->left) + visit(curr->right);
+  }
+  CostType visitStringTest(StringTest* curr) {
+    // "3" copied from `visitStringEq`.
+    return 3 + visit(curr->ref);
   }
   CostType visitStringWTF16Get(StringWTF16Get* curr) {
     return 1 + visit(curr->ref) + visit(curr->pos);

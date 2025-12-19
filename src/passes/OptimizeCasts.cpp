@@ -167,6 +167,7 @@ struct EarlyCastFinder
 
     // TODO: generalize this when we handle more than RefAsNonNull.
     RefCast dummyRefCast(module->allocator);
+    dummyRefCast.desc = nullptr;
     RefAs dummyRefAs(module->allocator);
     dummyRefAs.op = RefAsNonNull;
 
@@ -342,11 +343,6 @@ struct EarlyCastFinder
           // change the best cast to move.
           bestMove.bestCast = curr;
         }
-        // We don't care about the safety of the cast at present. If there are
-        // two casts with the same type one being safe and one being unsafe, the
-        // first cast that we visit will be chosen to be moved. Perhaps in the
-        // future we can consider prioritizing unsafe casts over safe ones since
-        // users may be more interested in that.
       }
     }
   }

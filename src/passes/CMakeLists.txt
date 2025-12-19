@@ -46,12 +46,12 @@ set(passes_SOURCES
   GlobalStructInference.cpp
   GlobalTypeOptimization.cpp
   GUFA.cpp
-  hash-stringify-walker.cpp
   Outlining.cpp
   Heap2Local.cpp
   HeapStoreOptimization.cpp
   I64ToI32Lowering.cpp
   Inlining.cpp
+  InstrumentBranchHints.cpp
   InstrumentLocals.cpp
   InstrumentMemory.cpp
   Intrinsics.cpp
@@ -102,6 +102,7 @@ set(passes_SOURCES
   Strip.cpp
   StripTargetFeatures.cpp
   TraceCalls.cpp
+  RandomizeBranchHints.cpp
   RedundantSetElimination.cpp
   RemoveImports.cpp
   RemoveMemoryInit.cpp
@@ -113,6 +114,7 @@ set(passes_SOURCES
   ReorderFunctions.cpp
   ReorderGlobals.cpp
   ReorderLocals.cpp
+  ReorderTypes.cpp
   ReReloop.cpp
   TrapMode.cpp
   TypeGeneralizing.cpp

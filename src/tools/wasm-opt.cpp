@@ -79,6 +79,7 @@ int main(int argc, const char* argv[]) {
   bool converge = false;
   bool fuzzExecBefore = false;
   bool fuzzExecAfter = false;
+  std::string fuzzExecSecond;
   std::string extraFuzzCommand;
   bool translateToFuzz = false;
   std::string initialFuzz;
@@ -86,6 +87,7 @@ int main(int argc, const char* argv[]) {
   bool fuzzMemory = true;
   bool fuzzOOB = true;
   bool fuzzPreserveImportsAndExports = false;
+  std::string fuzzImport;
   std::string emitSpecWrapper;
   std::string emitWasm2CWrapper;
   std::string inputSourceMapFilename;
@@ -95,7 +97,21 @@ int main(int argc, const char* argv[]) {
 
   const std::string WasmOptOption = "wasm-opt options";
 
-  OptimizationOptions options("wasm-opt", "Read, write, and optimize files");
+  OptimizationOptions options("wasm-opt",
+                              R"(Read, write, and optimize files.
+
+Example usage:
+
+  wasm-opt input.wasm -O3 -o output.wasm
+
+This reads an input wasm file, optimizes with -O3, and writes out the result.
+
+For more on how to optimize effectively, see
+
+  https://github.com/WebAssembly/binaryen/wiki/Optimizer-Cookbook
+  https://github.com/WebAssembly/binaryen/wiki/GC-Optimization-Guidebook
+                            )");
+
   options
     .add("--output",
          "-o",
@@ -133,6 +149,15 @@ int main(int argc, const char* argv[]) {
          Options::Arguments::Zero,
          [&](Options* o, const std::string& arguments) {
            fuzzExecBefore = fuzzExecAfter = true;
+         })
+    .add("--fuzz-exec-second",
+         "",
+         "A second module to link with the first, for fuzz-exec-before (only "
+         "before, as optimizations are not applied to it)",
+         WasmOptOption,
+         Options::Arguments::One,
+         [&](Options* o, const std::string& arguments) {
+           fuzzExecSecond = arguments;
          })
     .add("--extra-fuzz-command",
          "-efc",
@@ -187,6 +212,13 @@ int main(int argc, const char* argv[]) {
          [&](Options* o, const std::string& arguments) {
            fuzzPreserveImportsAndExports = true;
          })
+    .add(
+      "--fuzz-import",
+      "",
+      "a module to use as an import in -ttf mode",
+      WasmOptOption,
+      Options::Arguments::One,
+      [&](Options* o, const std::string& arguments) { fuzzImport = arguments; })
     .add("--emit-spec-wrapper",
          "-esw",
          "Emit a wasm spec interpreter wrapper file that can run the wasm with "
@@ -314,12 +346,15 @@ int main(int argc, const char* argv[]) {
   if (translateToFuzz) {
     TranslateToFuzzReader reader(
       wasm, options.extra["infile"], options.passOptions.closedWorld);
-    if (fuzzPasses) {
-      reader.pickPasses(options);
-    }
     reader.setAllowMemory(fuzzMemory);
     reader.setAllowOOB(fuzzOOB);
     reader.setPreserveImportsAndExports(fuzzPreserveImportsAndExports);
+    if (!fuzzImport.empty()) {
+      reader.setImportedModule(fuzzImport);
+    }
+    if (fuzzPasses) {
+      reader.pickPasses(options);
+    }
     reader.build();
     if (options.passOptions.validate) {
       if (!WasmValidator().validate(wasm, options.passOptions)) {
@@ -331,7 +366,16 @@ int main(int argc, const char* argv[]) {
 
   ExecutionResults results;
   if (fuzzExecBefore) {
-    results.get(wasm);
+    if (fuzzExecSecond.empty()) {
+      results.collect(wasm);
+    } else {
+      // Add the second module.
+      Module second;
+      second.features = wasm.features;
+      ModuleReader().read(fuzzExecSecond, second);
+
+      results.collect(wasm, &second);
+    }
   }
 
   if (emitSpecWrapper.size() > 0) {
@@ -422,7 +466,15 @@ int main(int argc, const char* argv[]) {
 
   if (options.extra.count("output") == 0) {
     if (!options.quiet) {
-      std::cerr << "warning: no output file specified, not emitting output\n";
+      bool printsToStdout = std::any_of(
+        options.passes.begin(),
+        options.passes.end(),
+        [](const OptimizationOptions::PassInfo& info) {
+          return info.name == "print" || info.name == "print-function-map";
+        });
+      if (!printsToStdout) {
+        std::cerr << "warning: no output file specified, not emitting output\n";
+      }
     }
     return 0;
   }

@@ -16,6 +16,7 @@
 
 #include "lexer.h"
 #include "literal.h"
+#include "wasm-features.h"
 #include "wat-parser.h"
 
 namespace wasm::WATParser {
@@ -87,16 +88,21 @@ Result<Action> action(Lexer& in) {
   return in.err("expected action");
 }
 
-// (module id? binary string*)
-// (module id? quote string*)
-// (module ...)
+// (module id binary string*)
+// (module id quote string*)
+// (module definition id? ...)
+// (module definition id? binary ...)
 Result<WASTModule> wastModule(Lexer& in, bool maybeInvalid = false) {
   Lexer reset = in;
   if (!in.takeSExprStart("module"sv)) {
     return in.err("expected module");
   }
-  // TODO: use ID?
-  [[maybe_unused]] auto id = in.takeID();
+
+  bool isDefinition = in.takeKeyword("definition"sv);
+  std::optional<Name> id = in.takeID();
+
+  Lexer moduleBody = in;
+
   QuotedModuleType type;
   if (in.takeKeyword("quote"sv)) {
     type = QuotedModuleType::Text;
@@ -117,14 +123,24 @@ Result<WASTModule> wastModule(Lexer& in, bool maybeInvalid = false) {
       }
     }
     std::string mod(reset.next().substr(0, in.getPos() - reset.getPos()));
-    return QuotedModule{QuotedModuleType::Text, mod};
+    return WASTModule{isDefinition, QuotedModule{QuotedModuleType::Text, mod}};
   } else {
-    // This is a normal inline module that should be parseable. Reset to the
-    // start and parse it normally.
-    in = std::move(reset);
+    // In this case the module is mostly valid WAT, unless it is a module
+    // definition in which case it will begin with (module definition ...)
+    in = std::move(moduleBody);
+
     auto wasm = std::make_shared<Module>();
-    CHECK_ERR(parseModule(*wasm, in));
-    return wasm;
+    if (id) {
+      wasm->name = *id;
+    }
+
+    wasm->features = FeatureSet::All;
+    CHECK_ERR(parseModuleBody(*wasm, in));
+    if (!in.takeRParen()) {
+      return in.err("expected end of module");
+    }
+
+    return WASTModule{isDefinition, wasm};
   }
 
   // We have a quote or binary module. Collect its contents.
@@ -137,7 +153,7 @@ Result<WASTModule> wastModule(Lexer& in, bool maybeInvalid = false) {
     return in.err("expected end of module");
   }
 
-  return QuotedModule{type, ss.str()};
+  return WASTModule{isDefinition, QuotedModule{type, ss.str()}};
 }
 
 Result<NaNKind> nan(Lexer& in) {
@@ -209,6 +225,13 @@ Result<ExpectedResult> result(Lexer& in) {
       return in.err("expected end of v128.const");
     }
     return lanes;
+  }
+
+  if (in.takeSExprStart("ref.null")) {
+    if (!in.takeRParen()) {
+      return in.err("expected end of ref.null");
+    }
+    return NullRefResult{};
   }
 
   if (in.takeSExprStart("ref.extern")) {
@@ -381,6 +404,25 @@ MaybeResult<Assertion> assertTrap(Lexer& in) {
   return Assertion{AssertModule{ModuleAssertionType::Trap, *mod}};
 }
 
+// (assert_suspension action msg)
+MaybeResult<Assertion> assertSuspension(Lexer& in) {
+  if (!in.takeSExprStart("assert_suspension"sv)) {
+    return {};
+  }
+  if (auto a = maybeAction(in)) {
+    CHECK_ERR(a);
+    auto msg = in.takeString();
+    if (!msg) {
+      return in.err("expected error message");
+    }
+    if (!in.takeRParen()) {
+      return in.err("expected end of assertion");
+    }
+    return Assertion{AssertAction{ActionAssertionType::Suspension, *a}};
+  }
+  return in.err("invalid assert_suspension");
+}
+
 MaybeResult<Assertion> assertion(Lexer& in) {
   if (auto a = assertReturn(in)) {
     CHECK_ERR(a);
@@ -402,6 +444,10 @@ MaybeResult<Assertion> assertion(Lexer& in) {
     CHECK_ERR(a);
     return *a;
   }
+  if (auto a = assertSuspension(in)) {
+    CHECK_ERR(a);
+    return *a;
+  }
   return {};
 }
 
@@ -415,17 +461,42 @@ MaybeResult<Register> register_(Lexer& in) {
     return in.err("expected name");
   }
 
-  // TODO: Do we need to use this optional id?
-  in.takeID();
+  auto instanceName = in.takeID();
 
   if (!in.takeRParen()) {
-    // TODO: handle optional module id.
     return in.err("expected end of register command");
   }
-  return Register{*name};
+
+  return Register{*name, instanceName};
 }
 
-// module | register | action | assertion
+// (module instance instance_name? module_name?)
+MaybeResult<ModuleInstantiation> instantiation(Lexer& in) {
+  Lexer reset = in;
+  if (!in.takeSExprStart("module"sv)) {
+    std::optional<std::string_view> actual = in.peekKeyword();
+    return in.err((std::stringstream() << "expected `module` keyword but got "
+                                       << actual.value_or("<not a keyword>"))
+                    .str());
+  }
+
+  if (!in.takeKeyword("instance"sv)) {
+    // This is not a module instance and probably a module instead.
+    in = reset;
+    return {};
+  }
+
+  auto instanceId = in.takeID();
+  auto moduleId = in.takeID();
+
+  if (!in.takeRParen()) {
+    return in.err("expected end of module instantiation");
+  }
+
+  return ModuleInstantiation{moduleId, instanceId};
+}
+
+// instantiate | module | register | action | assertion
 Result<WASTCommand> command(Lexer& in) {
   if (auto cmd = register_(in)) {
     CHECK_ERR(cmd);
@@ -439,9 +510,14 @@ Result<WASTCommand> command(Lexer& in) {
     CHECK_ERR(cmd);
     return *cmd;
   }
-  auto mod = wastModule(in);
-  CHECK_ERR(mod);
-  return *mod;
+  if (auto cmd = instantiation(in)) {
+    CHECK_ERR(cmd);
+    return *cmd;
+  }
+
+  auto module = wastModule(in);
+  CHECK_ERR(module);
+  return *module;
 }
 
 #pragma GCC diagnostic push
@@ -456,12 +532,14 @@ Result<WASTScript> wast(Lexer& in) {
       // The entire script might be a single module comprising a sequence of
       // module fields with a top-level `(module ...)`.
       auto wasm = std::make_shared<Module>();
+      wasm->features = FeatureSet::All;
       auto parsed = parseModule(*wasm, in.buffer);
       if (parsed.getErr()) {
         // No, that wasn't the problem. Return the original error.
         return Err{err->msg};
       }
-      cmds.push_back({WASTModule{std::move(wasm)}, line});
+      cmds.push_back(
+        {WASTModule{/*isDefinition=*/false, std::move(wasm)}, line});
       return cmds;
     }
     CHECK_ERR(cmd);

@@ -37,13 +37,13 @@
 
 #include "ir/module-utils.h"
 #include "ir/names.h"
-#include "ir/subtype-exprs.h"
 #include "ir/type-updating.h"
 #include "ir/utils.h"
 #include "pass.h"
 #include "passes/string-utils.h"
 #include "support/string.h"
 #include "wasm-builder.h"
+#include "wasm-type.h"
 #include "wasm.h"
 
 namespace wasm {
@@ -227,9 +227,6 @@ struct StringLowering : public StringGathering {
     // Replace string.* etc. operations with imported ones.
     replaceInstructions(module);
 
-    // Replace ref.null types as needed.
-    replaceNulls(module);
-
     // ReFinalize to apply all the above changes.
     ReFinalize().run(getPassRunner(), module);
 
@@ -286,11 +283,13 @@ struct StringLowering : public StringGathering {
   }
 
   // Common types used in imports.
-  Type nullArray16 = Type(Array(Field(Field::i16, Mutable)), Nullable);
+  Type nullArray16 = Type(HeapTypes::getMutI16Array(), Nullable);
   Type nullExt = Type(HeapType::ext, Nullable);
   Type nnExt = Type(HeapType::ext, NonNullable);
 
   void updateTypes(Module* module) {
+    TypeMapper::TypeUpdates updates;
+
     // TypeMapper will not handle public types, but we do want to modify them as
     // well: we are modifying the public ABI here. We can't simply tell
     // TypeMapper to consider them private, as then they'd end up in the new big
@@ -306,7 +305,7 @@ struct StringLowering : public StringGathering {
     // function, which must be modified either in TypeMapper - but as just
     // explained we cannot do that - or before it, which is what we do here).
     for (auto& func : module->functions) {
-      if (func->type.getRecGroup().size() != 1 ||
+      if (func->type.getHeapType().getRecGroup().size() != 1 ||
           !func->type.getFeatures().hasStrings()) {
         continue;
       }
@@ -321,35 +320,22 @@ struct StringLowering : public StringGathering {
         }
         return t;
       };
-      for (auto param : func->type.getSignature().params) {
+      for (auto param : func->type.getHeapType().getSignature().params) {
         params.push_back(fix(param));
       }
-      for (auto result : func->type.getSignature().results) {
+      for (auto result : func->type.getHeapType().getSignature().results) {
         results.push_back(fix(result));
       }
-      func->type = Signature(params, results);
-    }
 
-    TypeMapper::TypeUpdates updates;
+      // In addition to doing the update, mark it in the map of updates for
+      // TypeMapper, so RefFuncs with this type get updated.
+      auto old = func->type;
+      func->type = func->type.with(Signature(params, results));
+      updates[old.getHeapType()] = func->type.getHeapType();
+    }
 
     // Strings turn into externref.
     updates[HeapType::string] = HeapType::ext;
-
-    // The module may have its own array16 type inside a big rec group, but
-    // imported strings expects that type in its own rec group as part of the
-    // ABI. Fix that up here. (This is valid to do as this type has no sub- or
-    // super-types anyhow; it is "plain old data" for communicating with the
-    // outside.)
-    auto allTypes = ModuleUtils::collectHeapTypes(*module);
-    auto array16 = nullArray16.getHeapType();
-    auto array16Element = array16.getArray().element;
-    for (auto type : allTypes) {
-      // Match an array type with no super and that is closed.
-      if (type.isArray() && !type.getDeclaredSuperType() && !type.isOpen() &&
-          type.getArray().element == array16Element) {
-        updates[type] = array16;
-      }
-    }
 
     TypeMapper(*module, updates).map();
   }
@@ -360,6 +346,7 @@ struct StringLowering : public StringGathering {
   Name fromCodePointImport;
   Name concatImport;
   Name equalsImport;
+  Name testImport;
   Name compareImport;
   Name lengthImport;
   Name charCodeAtImport;
@@ -371,7 +358,8 @@ struct StringLowering : public StringGathering {
     auto name = Names::getValidFunctionName(*module, trueName);
     auto sig = Signature(params, results);
     Builder builder(*module);
-    auto* func = module->addFunction(builder.makeFunction(name, sig, {}));
+    auto* func = module->addFunction(
+      builder.makeFunction(name, Type(sig, NonNullable, Inexact), {}));
     func->module = WasmStringsModule;
     func->base = trueName;
     return name;
@@ -395,6 +383,8 @@ struct StringLowering : public StringGathering {
                                         Type::i32);
     // string.equals: string, string -> i32
     equalsImport = addImport(module, "equals", {nullExt, nullExt}, Type::i32);
+    // string.test: externref -> i32
+    testImport = addImport(module, "test", {nullExt}, Type::i32);
     // string.compare: string, string -> i32
     compareImport = addImport(module, "compare", {nullExt, nullExt}, Type::i32);
     // string.length: string -> i32
@@ -471,6 +461,12 @@ struct StringLowering : public StringGathering {
         }
       }
 
+      void visitStringTest(StringTest* curr) {
+        Builder builder(*getModule());
+        replaceCurrent(
+          builder.makeCall(lowering.testImport, {curr->ref}, Type::i32));
+      }
+
       void visitStringMeasure(StringMeasure* curr) {
         Builder builder(*getModule());
         replaceCurrent(
@@ -494,61 +490,6 @@ struct StringLowering : public StringGathering {
     Replacer replacer(*this);
     replacer.run(getPassRunner(), module);
     replacer.walkModuleCode(module);
-  }
-
-  // A ref.null of none needs to be noext if it is going to a location of type
-  // stringref.
-  void replaceNulls(Module* module) {
-    // Use SubtypingDiscoverer to find when a ref.null of none flows into a
-    // place that has been changed from stringref to externref.
-    struct NullFixer
-      : public WalkerPass<
-          ControlFlowWalker<NullFixer, SubtypingDiscoverer<NullFixer>>> {
-      // Hooks for SubtypingDiscoverer.
-      void noteSubtype(Type, Type) {
-        // Nothing to do for pure types.
-      }
-      void noteSubtype(HeapType, HeapType) {
-        // Nothing to do for pure types.
-      }
-      void noteSubtype(Type, Expression*) {
-        // Nothing to do for a subtype of an expression.
-      }
-      void noteSubtype(Expression* a, Type b) {
-        // This is the case we care about: if |a| is a null that must be a
-        // subtype of ext then we fix that up.
-        if (!b.isRef()) {
-          return;
-        }
-        HeapType top = b.getHeapType().getTop();
-        if (top.isMaybeShared(HeapType::ext)) {
-          if (auto* null = a->dynCast<RefNull>()) {
-            null->finalize(HeapTypes::noext.getBasic(top.getShared()));
-          }
-        }
-      }
-      void noteSubtype(Expression* a, Expression* b) {
-        // Only the type matters of the place we assign to.
-        noteSubtype(a, b->type);
-      }
-      void noteNonFlowSubtype(Expression* a, Type b) {
-        // Flow or non-flow is the same for us.
-        noteSubtype(a, b);
-      }
-      void noteCast(HeapType, HeapType) {
-        // Casts do not concern us.
-      }
-      void noteCast(Expression*, Type) {
-        // Casts do not concern us.
-      }
-      void noteCast(Expression*, Expression*) {
-        // Casts do not concern us.
-      }
-    };
-
-    NullFixer fixer;
-    fixer.run(getPassRunner(), module);
-    fixer.walkModuleCode(module);
   }
 };
 

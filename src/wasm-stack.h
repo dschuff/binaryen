@@ -93,17 +93,16 @@ public:
   BinaryInstWriter(WasmBinaryWriter& parent,
                    BufferWithRandomAccess& o,
                    Function* func,
-                   bool sourceMap,
                    bool DWARF)
-    : parent(parent), o(o), func(func), sourceMap(sourceMap), DWARF(DWARF) {}
+    : parent(parent), o(o), func(func), DWARF(DWARF) {}
 
   void visit(Expression* curr) {
-    if (func && !sourceMap) {
-      parent.writeDebugLocation(curr, func);
+    if (func) {
+      parent.trackExpressionStart(curr, func);
     }
     OverriddenVisitor<BinaryInstWriter>::visit(curr);
-    if (func && !sourceMap) {
-      parent.writeDebugLocationEnd(curr, func);
+    if (func) {
+      parent.trackExpressionEnd(curr, func);
     }
   }
 
@@ -136,7 +135,6 @@ private:
   WasmBinaryWriter& parent;
   BufferWithRandomAccess& o;
   Function* func = nullptr;
-  bool sourceMap;
   bool DWARF;
 
   std::vector<Name> breakStack;
@@ -169,16 +167,11 @@ private:
   // when they have a value that is more refined than the wasm type system
   // allows atm (and they are not dropped, in which case the type would not
   // matter). See https://github.com/WebAssembly/binaryen/pull/6390 for more on
-  // the difference. As a result of the difference, we will insert extra casts
-  // to ensure validation in the wasm spec. The wasm spec will hopefully improve
-  // to use the more refined type as well, which would remove the need for this
-  // hack.
-  //
-  // Each br_if present as a key here is mapped to the unrefined type for it.
-  // That is, the br_if has a type in Binaryen IR that is too refined, and the
-  // map contains the unrefined one (which we need to know the local types, as
-  // we'll stash the unrefined values and then cast them).
-  std::unordered_map<Break*, Type> brIfsNeedingHandling;
+  // the difference. As a result of the difference, we must fix things up for
+  // the spec. (The wasm spec might - hopefully - improve to use the more
+  // refined type as well, which would remove the need for this hack, and
+  // improve code size in general.)
+  std::unordered_set<Break*> brIfsNeedingHandling;
 };
 
 // Takes binaryen IR and converts it to something else (binary or stack IR)
@@ -452,7 +445,7 @@ public:
                            bool sourceMap = false,
                            bool DWARF = false)
     : BinaryenIRWriter<BinaryenIRToBinaryWriter>(func), parent(parent),
-      writer(parent, o, func, sourceMap, DWARF), sourceMap(sourceMap) {}
+      writer(parent, o, func, DWARF), sourceMap(sourceMap) {}
 
   void emit(Expression* curr) { writer.visit(curr); }
   void emitHeader() {
@@ -480,7 +473,7 @@ public:
   void emitUnreachable() { writer.emitUnreachable(); }
   void emitDebugLocation(Expression* curr) {
     if (sourceMap) {
-      parent.writeDebugLocation(curr, func);
+      parent.writeSourceMapLocation(curr, func);
     }
   }
 
@@ -521,7 +514,7 @@ public:
                         StackIR& stackIR,
                         bool sourceMap = false,
                         bool DWARF = false)
-    : parent(parent), writer(parent, o, func, sourceMap, DWARF), func(func),
+    : parent(parent), writer(parent, o, func, DWARF), func(func),
       stackIR(stackIR), sourceMap(sourceMap) {}
 
   void write();
