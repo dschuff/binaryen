@@ -6,10 +6,10 @@ RUN \
     apt-get install -y build-essential cmake python3 curl ninja-build git python3-pip
 
 # Download and install nvm:
-RUN curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.2/install.sh | bash
+RUN curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.3/install.sh | bash
 # in lieu of restarting the shell
 # set env
-ENV NVM_DIR="$HOME/.nvm"
+ENV NVM_DIR="/root/.nvm"
 
 # install node
 RUN bash -c "source $NVM_DIR/nvm.sh && nvm install 24"
