@@ -1,0 +1,7 @@
+; C/C++-style comments are supported.
+; This is a test for the normal import section.
+
+; RUN: wasm-dis %s.wasm -o - | filecheck %s
+
+; CHECK:      (import "env" "f" (func $fimport{{.*}} (param i32)))
+; CHECK-NEXT: (import "env" "g" (func $fimport{{.*}} (param i32)))

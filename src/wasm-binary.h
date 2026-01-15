@@ -405,6 +405,8 @@ enum EncodedType {
   Rec = 0x4e,
   Descriptor = 0x4d,
   Describes = 0x4c,
+  CompactImport1 = 0x14,
+  CompactImport2 = 0x15,
   // block_type
   Empty = -0x40, // 0x40
 };
@@ -461,6 +463,7 @@ extern const char* BulkMemoryOptFeature;
 extern const char* CallIndirectOverlongFeature;
 extern const char* CustomDescriptorsFeature;
 extern const char* RelaxedAtomicsFeature;
+extern const char* CompactImportFeature;
 
 enum Subsection {
   NameModule = 0,
@@ -1636,6 +1639,7 @@ public:
                           Type& addressType,
                           Address defaultIfNoMax);
   void readImports();
+  void readImport(Name module, Name base, uint32_t kind);
 
   // The signatures of each function, including imported functions, given in the
   // import and function sections. Store HeapTypes instead of Signatures because

@@ -1,0 +1,14 @@
+;; RUN: wasm-as %s --enable-compact-import -o %t.wasm
+;; RUN: wasm-dis %t.wasm | filecheck %s
+
+(module
+  (import "env" "f1" (func))
+  (import "env" "f2" (func))
+  (import "env" "g1" (global i32))
+  (import "other" "f1" (func))
+)
+
+;; CHECK:      (import "env" "g1" (global $gimport$0 i32))
+;; CHECK-NEXT: (import "env" "f1" (func $fimport$0))
+;; CHECK-NEXT: (import "env" "f2" (func $fimport$1))
+;; CHECK-NEXT: (import "other" "f1" (func $fimport$2))
