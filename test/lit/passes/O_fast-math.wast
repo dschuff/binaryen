@@ -5,9 +5,9 @@
 
 ;; with fast-math we can optimize some of these patterns
 (module
- ;; CHECK:      (type $0 (func (result f32)))
+ ;; CHECK:      (type $0 (func (param f32) (result f32)))
 
- ;; CHECK:      (type $1 (func (param f32) (result f32)))
+ ;; CHECK:      (type $1 (func (result f32)))
 
  ;; CHECK:      (type $2 (func (param f64) (result f64)))
 
@@ -36,6 +36,10 @@
  ;; CHECK:      (export "abs_sub_zero1" (func $abs_sub_zero1))
 
  ;; CHECK:      (export "abs_sub_zero2" (func $abs_sub_zero2))
+
+ ;; CHECK:      (export "abs_mul" (func $0))
+
+ ;; CHECK:      (export "abs_div" (func $1))
 
  ;; CHECK:      (func $div (result f32)
  ;; CHECK-NEXT:  (f32.const -nan:0x23017a)
@@ -150,4 +154,35 @@
    )
   )
  )
+ (func  (export "abs_mul") (param $x f32) (result f32)
+  ;; abs(x * x)   ==>   x * x
+  (f32.abs
+   (f32.mul
+    (local.get $x)
+    (local.get $x)
+   )
+  )
+ )
+ (func  (export "abs_div") (param $x f32) (result f32)
+  ;; abs(x / x)   ==>   x / x
+  (f32.abs
+   (f32.div
+    (local.get $x)
+    (local.get $x)
+   )
+  )
+ )
 )
+;; CHECK:      (func $0 (param $0 f32) (result f32)
+;; CHECK-NEXT:  (f32.mul
+;; CHECK-NEXT:   (local.get $0)
+;; CHECK-NEXT:   (local.get $0)
+;; CHECK-NEXT:  )
+;; CHECK-NEXT: )
+
+;; CHECK:      (func $1 (param $0 f32) (result f32)
+;; CHECK-NEXT:  (f32.div
+;; CHECK-NEXT:   (local.get $0)
+;; CHECK-NEXT:   (local.get $0)
+;; CHECK-NEXT:  )
+;; CHECK-NEXT: )

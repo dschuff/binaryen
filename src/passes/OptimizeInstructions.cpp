@@ -1128,8 +1128,11 @@ struct OptimizeInstructions
       }
       // abs(x * x)   ==>   x * x
       // abs(x / x)   ==>   x / x
+      // Only for fast math: x * x and x / x can produce a negative NaN,
+      // whereas abs clears the sign bit of NaNs.
       if (auto* binary = curr->value->dynCast<Binary>()) {
-        if ((binary->op == Abstract::getBinary(binary->type, Abstract::Mul) ||
+        if (fastMath &&
+            (binary->op == Abstract::getBinary(binary->type, Abstract::Mul) ||
              binary->op == Abstract::getBinary(binary->type, Abstract::DivS)) &&
             areConsecutiveInputsEqual(binary->left, binary->right)) {
           return replaceCurrent(binary);
