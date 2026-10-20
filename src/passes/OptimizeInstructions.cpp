@@ -738,6 +738,14 @@ struct OptimizeInstructions
             }
           }
         }
+        // x / x   ==>   1.0
+        if (curr->op == DivFloat32 || curr->op == DivFloat64) {
+          if (areConsecutiveInputsEqual(curr->left, curr->right)) {
+            Builder builder(*getModule());
+            return replaceCurrent(
+              builder.makeConst(Literal::makeOne(curr->type)));
+          }
+        }
       }
     }
     // a bunch of operations on a constant right side can be simplified
@@ -1127,10 +1135,15 @@ struct OptimizeInstructions
         }
       }
       // abs(x * x)   ==>   x * x
-      // abs(x / x)   ==>   x / x
+      // abs(x / x)   ==>   1.0
       if (auto* binary = curr->value->dynCast<Binary>()) {
-        if ((binary->op == Abstract::getBinary(binary->type, Abstract::Mul) ||
-             binary->op == Abstract::getBinary(binary->type, Abstract::DivS)) &&
+        if (binary->op == Abstract::getBinary(binary->type, Abstract::DivS) &&
+            areConsecutiveInputsEqual(binary->left, binary->right)) {
+          Builder builder(*getModule());
+          return replaceCurrent(
+            builder.makeConst(Literal::makeOne(binary->type)));
+        }
+        if (binary->op == Abstract::getBinary(binary->type, Abstract::Mul) &&
             areConsecutiveInputsEqual(binary->left, binary->right)) {
           return replaceCurrent(binary);
         }
